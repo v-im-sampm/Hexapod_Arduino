@@ -52,6 +52,30 @@
 			}
 		},
 		{
+			"label": "Hexapod: Upload Only (COM12)",
+			"type": "process",
+			"command": "${env:WINDIR}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}\\tools\\flash.ps1",
+				"-UploadOnly",
+				"-Port",
+				"COM12"
+			],
+			"problemMatcher": [],
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated",
+				"clear": true
+			}
+		},
+		{
 			"label": "Hexapod: Serial Console",
 			"type": "process",
 			"command": "${env:WINDIR}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",

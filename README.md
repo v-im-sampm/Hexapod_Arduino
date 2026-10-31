@@ -139,7 +139,10 @@ The tasks in [.vscode/tasks.json](.vscode/tasks.json) launch **Windows PowerShel
 |---|---|
 | **Hexapod: Build** | Build without a connected board; also available through Ctrl+Shift+B |
 | **Hexapod: Flash + Serial Console** | Prompt for COM port, build, upload, then accept serial input |
+| **Hexapod: Upload Only (COM12)** | Upload existing build artifacts to hard-coded **COM12**, without building or opening a monitor |
 | **Hexapod: Serial Console** | Prompt for COM port and reconnect without building/flashing |
+
+Use **Hexapod: Build** at least once before **Hexapod: Upload Only (COM12)**. Upload-only uses the existing binaries in [.build/esp32](.build/esp32), not the current source: rebuild first if you want to include code changes. Keep servo power disconnected and close any serial monitor using COM12 before uploading.
 
 Alternatively, in a **Windows PowerShell** terminal opened at the repository root:
 
@@ -151,6 +154,7 @@ Replace `COM5` with the actual port; omit `-Port` to be prompted. The same scrip
 
 ```powershell
 .\tools\flash.ps1 -BuildOnly
+.\tools\flash.ps1 -UploadOnly -Port COM12
 .\tools\flash.ps1 -MonitorOnly -Port COM5
 ```
 
@@ -162,7 +166,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\flash.ps1 -Port 
 
 [tools/flash.ps1](tools/flash.ps1) finds `arduino-cli` on PATH or in the standard Arduino IDE 2.x installation locations. It reuses `%USERPROFILE%\.arduinoIDE\arduino-cli.yaml` when present, including the IDE's existing board packages and libraries. Without that file, the CLI uses its default configuration. Nonstandard installations can pass `-ArduinoCli "C:\path\arduino-cli.exe"` and/or `-ConfigFile "C:\path\arduino-cli.yaml"`.
 
-Build artifacts are cached in [.build/esp32](.build/esp32), which Git ignores. Build or upload failures stop the workflow instead of opening a misleading console or flashing stale artifacts. If only the monitor failed to open, fix the port/connection and use `-MonitorOnly`; a successful upload need not be repeated. The workflow does not request a full-flash erase, so existing NVS settings normally survive uploading.
+Build artifacts are cached in [.build/esp32](.build/esp32), which Git ignores. The normal flash workflow builds fresh artifacts and never uploads after a build failure; upload-only deliberately reuses the existing artifacts. Upload failures stop the workflow instead of opening a misleading console. If only the monitor failed to open, fix the port/connection and use `-MonitorOnly`; a successful upload need not be repeated. The workflow does not request a full-flash erase, so existing NVS settings normally survive uploading.
 
 The terminal monitor is **line-buffered**, allowing normal local typing/editing: press Enter to send a command. In this mode **`!` also needs Enter**; it is not an immediate keystroke emergency stop. Keep the physical power disconnect accessible.
 
@@ -374,6 +378,6 @@ The flashing-workflow tests use a fake CLI, so no board is needed and nothing is
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_flash.ps1
 ```
 
-[tests/test_flash.ps1](tests/test_flash.ps1) checks build/upload/monitor ordering, use of the same build artifacts, paths containing spaces, COM validation, failure propagation, monitor-only mode and forwarding typed input to the monitor.
+[tests/test_flash.ps1](tests/test_flash.ps1) checks build/upload/monitor ordering, the upload-only task fixed to COM12 (no build or monitor), use of the same build artifacts, paths containing spaces, COM validation, failure propagation, monitor-only mode and forwarding typed input to the monitor.
 
 Original authors: Ozgur Toprak Onsoy and Emre Kalem. See [LICENSE](LICENSE). The supplied [ESP-NOW examples](espnow/) are retained as transmitter/protocol references; their bulldozer motor and LED logic is not part of the hexapod firmware.

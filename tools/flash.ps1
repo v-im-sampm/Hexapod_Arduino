@@ -3,11 +3,15 @@
 [CmdletBinding(DefaultParameterSetName = 'Flash')]
 param(
     [Parameter(ParameterSetName = 'Flash')]
+    [Parameter(ParameterSetName = 'Upload')]
     [Parameter(ParameterSetName = 'Monitor')]
     [string]$Port,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Build')]
     [switch]$BuildOnly,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Upload')]
+    [switch]$UploadOnly,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Monitor')]
     [switch]$MonitorOnly,
@@ -88,12 +92,16 @@ if ($ConfigFile) {
 }
 
 if (-not $MonitorOnly) {
-    Invoke-Arduino -Stage 'Build' -Arguments @(
-        'compile', '--fqbn', $fqbn, '--build-path', $buildPath, $repoRoot
-    )
-    if ($BuildOnly) {
-        Write-Host "`nBuild complete: $buildPath"
-        return
+    if (-not $UploadOnly) {
+        Invoke-Arduino -Stage 'Build' -Arguments @(
+            'compile', '--fqbn', $fqbn, '--build-path', $buildPath, $repoRoot
+        )
+        if ($BuildOnly) {
+            Write-Host "`nBuild complete: $buildPath"
+            return
+        }
+    } else {
+        Write-Host "`nUploading existing artifacts from $buildPath; source changes are not rebuilt."
     }
 
     Write-Host "`nKeep servo power disconnected. Close any other monitor using $Port."
@@ -101,6 +109,10 @@ if (-not $MonitorOnly) {
         'upload', '--fqbn', $fqbn, '--port', $Port, '--protocol', 'serial',
         '--input-dir', $buildPath, '--discovery-timeout', '5s', $repoRoot
     )
+    if ($UploadOnly) {
+        Write-Host "`nUpload complete on $Port."
+        return
+    }
 }
 
 Write-Host "`nSerial console on $Port at 115200 baud."

@@ -82,7 +82,6 @@ uint16_t lastPulses[LEG_COUNT][JOINT_COUNT] = {};
 uint16_t targetPulses[LEG_COUNT][JOINT_COUNT] = {};
 constexpr size_t SERVO_COUNT = LEG_COUNT * JOINT_COUNT;
 constexpr uint32_t SERVO_STAGGER_MS = 250;
-constexpr uint32_t SERVO_WRITE_SPACING_MS = 1;
 bool posePending = false;
 size_t nextServo = 0;
 uint32_t lastServoWriteMs = 0;
@@ -290,9 +289,10 @@ void update_servo_outputs(uint32_t now)
       uint32_t(now - lastServoWriteMs) < servoWriteWaitMs)
     return;
 
+  const size_t firstServo = nextServo;
   for (size_t offset = 0; offset < SERVO_COUNT; ++offset)
   {
-    const size_t index = (nextServo + offset) % SERVO_COUNT;
+    const size_t index = (firstServo + offset) % SERVO_COUNT;
     const size_t leg = index / JOINT_COUNT;
     const size_t joint = index % JOINT_COUNT;
     const uint16_t target = targetPulses[leg][joint];
@@ -302,10 +302,11 @@ void update_servo_outputs(uint32_t now)
     if (!write_pulse(leg, joint, target))
       return;
     digitalWrite(SERVO_OE, LOW);
-    servoWriteWaitMs = stagger ? SERVO_STAGGER_MS : SERVO_WRITE_SPACING_MS;
+    servoWriteWaitMs = stagger ? SERVO_STAGGER_MS : 0;
     nextServo = (index + 1) % SERVO_COUNT;
-    // Never catch up with a burst after a delayed loop.
-    return;
+    // Startup/poses are staggered; an active gait frame must finish before the next target.
+    if (stagger)
+      return;
   }
   if (posePending)
   {
@@ -754,9 +755,8 @@ bool execute_command(const Command& command)
     else if (command.type == CommandType::Web)
     {
       mode = Mode::Web;
-      webMotion.receivedMs = millis();
       console.println("Web driving selected; waits for home startup before moving."
-                      " Hold a direction on the page. Link loss stops motion.");
+                      " No web timeout: link loss may leave motion running. Use stop/off to stop.");
     }
     else
       console.println("Home stance selected; radio ignored.");
@@ -1082,7 +1082,7 @@ void process_web_request(WebRequest& request, WebResponse& response)
     }
     else
     {
-      webMotion = {direction, rotation, millis()};
+      webMotion = {direction, rotation};
       write_web_status(response);
     }
     return;
@@ -1137,13 +1137,6 @@ void loop()
 {
   read_control();
   update_network();
-  if (mode == Mode::Web && uint32_t(millis() - webMotion.receivedMs) >= WEB_TIMEOUT_MS)
-  {
-    webMotion = WebMotion{};
-    mode = Mode::Home;
-    ++webGeneration;
-    console.println("Web control timeout: returning home; explicitly enable web driving again.");
-  }
   if (mode == Mode::Walk && !posePending && manualMotion.expired(millis()))
   {
     mode = Mode::Home;

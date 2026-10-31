@@ -56,8 +56,9 @@ Driving waits until ready. Stop cancels pending startup moves and holds only the
 <button data-direction="0" data-rotation="-1" disabled>Right</button>
 <button class="back" data-direction="-1" data-rotation="0" disabled>Reverse</button>
 </div>
-<small>A 500 ms missing-heartbeat watchdog returns toward home. A hidden tab, lost focus, or connection
-error ends this driving session; it does not resume automatically.</small>
+<small>Web driving has no timeout: the last motion command remains active until replaced or stopped.
+A hidden tab, lost focus, or connection error attempts to stop, but motion may continue if delivery fails.
+Use Serial stop/off or the physical power disconnect if the page cannot reach the robot.</small>
 </section>
 <section><h2>Servo sequence</h2>
 <p>Outputs must be off to start. Each joint moves 90 / 85 / 95 / 90 degrees, then pauses after each leg.</p>
@@ -124,10 +125,10 @@ function localStop() {
   driveButtons.forEach(button => button.disabled = true);
 }
 function disconnected(error) {
-  localStop();
+  leavePage();
   online = false;
   $('enable').disabled = true;
-  $('status').textContent = 'Disconnected - motion will stop; reconnect and enable again.';
+  $('status').textContent = 'Disconnected - motion may continue; use Serial stop/off or the power disconnect.';
   log(error.message || String(error));
 }
 async function request(path, payload, requestGeneration = generation, keepalive = false) {
@@ -152,10 +153,17 @@ function fillCalibration() {
 }
 async function command(text) {
   const ownVersion = ++version;
+  const wasEnabled = enabled;
   localStop();
   commandBusy = true;
   try {
     if (!online) throw new Error('Not connected. Reconnect to the Hexapod AP and wait for status.');
+    if (wasEnabled && !/^(web|stop|off|!)$/i.test(text)) {
+      const stopped = await request('/api/command', 'stop', driveGeneration);
+      if (ownVersion !== version) return;
+      if (!stopped.ok) throw new Error(stopped.text);
+      generation = stopped.generation;
+    }
     const result = await request('/api/command', text);
     if (ownVersion !== version) return;
     generation = result.generation;
@@ -273,8 +281,9 @@ function leavePage() {
   localStop();
   if (wasEnabled)
     request('/api/command', 'stop', driveGeneration, true).then(result => {
-      if (!result.ok) log(result.text);
-    }).catch(error => log('Stop not delivered: ' + error.message + '; watchdog will stop motion.'));
+      if (!result.ok) throw new Error(result.text);
+    }).catch(error => log('Stop not delivered: ' + error.message +
+      '; motion may continue. Use Serial stop/off or the physical power disconnect.'));
 }
 window.addEventListener('blur', leavePage);
 window.addEventListener('pagehide', leavePage);

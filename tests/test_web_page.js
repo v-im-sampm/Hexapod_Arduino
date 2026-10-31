@@ -101,44 +101,21 @@ test('heartbeats carry status throughout startup without competing status reques
   }
 });
 
-test('a slow serial HTTP status response cannot starve the 500 ms watchdog', async () => {
+test('a delayed drive reply does not end the session or queue status polls', async () => {
   const page = createPage();
   await enable(page);
-  let mode = 'web', generation = 2, lastHeartbeat = 0, timeouts = 0, maxGap = 0;
-  let active;
-  // The enable response took 200 ms; a competing 350 ms status response would expire the session.
-  for (let now = 200; now <= 5200; ++now) {
-    if (mode === 'web' && now - lastHeartbeat >= 500) {
-      mode = 'home';
-      ++generation;
-      ++timeouts;
-    }
-    if (active && now >= active.due) {
-      await page.reply(active.request, active.body, active.generation, active.ok);
-      active = undefined;
-    }
-    if (now % 50 === 0) page.intervals.get(50)();
-    if (now % 500 === 0) page.intervals.get(500)();
-    if (active || page.requests.length === 0) continue;
-
-    const request = page.requests.shift();
-    assert.ok(['/api/drive', '/api/status'].includes(request.path));
-    const driving = request.path === '/api/drive';
-    const ok = !driving || (mode === 'web' && Number(request.options.body.split('\n')[0]) === generation);
-    if (driving && ok) {
-      maxGap = Math.max(maxGap, now - lastHeartbeat);
-      lastHeartbeat = now;
-    }
-    active = {
-      request, generation, ok, due: now + (driving ? 40 : 350),
-      body: ok ? status({mode, generation, posePending: now < 4500}) : 'ERROR: control source changed'
-    };
+  const drive = page.requests.shift();
+  for (let elapsed = 0; elapsed <= 1500; elapsed += 50) {
+    page.intervals.get(50)();
+    page.intervals.get(500)();
+    assert.equal(page.requests.length, 0);
+    assert.equal(page.evaluate('enabled'), true);
   }
-  assert.equal(timeouts, 0, 'nonessential status traffic must not consume the heartbeat deadline');
-  assert.equal(mode, 'web');
-  assert.ok(maxGap > 0 && maxGap < 500);
+  await page.reply(drive, status({posePending: false}));
   assert.equal(page.evaluate('enabled'), true);
   assert.equal(page.elements.get('details').textContent.includes('Moving joints'), false);
+  page.intervals.get(50)();
+  assert.equal(page.requests.shift().path, '/api/drive');
 });
 
 test('drive input and release still use the current session', async () => {
@@ -171,15 +148,68 @@ test('a rejected session stops heartbeats and polling never re-enables driving',
   assert.ok(page.buttons.every(button => button.disabled));
 });
 
-test('connection loss stops driving instead of retrying automatically', async () => {
+test('connection loss attempts to stop and warns if delivery fails', async () => {
   const page = createPage();
   await enable(page);
   page.requests.shift().reject(new Error('Connection lost'));
   await page.flush();
   assert.equal(page.evaluate('enabled'), false);
   assert.match(page.elements.get('status').textContent, /Disconnected/);
+  assert.match(page.elements.get('status').textContent, /motion may continue/);
+  const stop = page.requests.shift();
+  assert.equal(stop.options.body, '2\nstop');
+  assert.equal(stop.options.keepalive, true);
+  stop.reject(new Error('Still disconnected'));
+  await page.flush();
+  assert.match(page.elements.get('log').textContent, /Stop not delivered: Still disconnected; motion may continue/);
+  assert.match(page.elements.get('log').textContent, /Serial stop\/off/);
   page.intervals.get(50)();
   assert.equal(page.requests.length, 0);
+});
+
+test('console commands explicitly stop driving before ending heartbeat updates', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  const pending = page.evaluate("command('help')");
+  const stop = page.requests.shift();
+  assert.equal(stop.options.body, '2\nstop');
+  assert.equal(page.evaluate('enabled'), false);
+  await page.reply(stop, 'Motion stopped.', 3);
+  const command = page.requests.shift();
+  assert.equal(command.options.body, '3\nhelp');
+  await page.reply(command, 'Commands', 3);
+  await pending;
+  assert.equal(page.requests.shift().path, '/api/status');
+});
+
+test('failed stop prevents the following console command and warns the user', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  const pending = page.evaluate("command('help')");
+  await page.reply(page.requests.shift(), 'ERROR: controller busy', 2, false);
+  await pending;
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.evaluate('enabled'), false);
+  assert.equal(page.evaluate('commandBusy'), false);
+  assert.match(page.elements.get('status').textContent, /motion may continue/);
+  assert.match(page.elements.get('log').textContent, /controller busy/);
+});
+
+test('stop and outputs off are sent directly without another stop request', async () => {
+  for (const text of ['stop', 'off', '!']) {
+    const page = createPage();
+    await enable(page);
+    await page.reply(page.requests.shift(), status());
+    const pending = page.evaluate(`command('${text}')`);
+    const command = page.requests.shift();
+    assert.equal(command.options.body, '2\n' + text);
+    await page.reply(command, 'Stopped.', 3);
+    await pending;
+    assert.equal(page.requests.shift().path, '/api/status');
+    assert.equal(page.requests.length, 0);
+  }
 });
 
 test('leaving the page stops the session and ignores an in-flight heartbeat reply', async () => {
@@ -196,5 +226,16 @@ test('leaving the page stops the session and ignores an in-flight heartbeat repl
   await page.reply(stop, 'Motion stopped.', 3);
   page.intervals.get(50)();
   assert.equal(page.requests.length, 0);
+  assert.equal(page.evaluate('enabled'), false);
+});
+
+test('a rejected leave-page stop warns instead of promising a watchdog stop', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  page.window.listeners.get('blur')();
+  await page.reply(page.requests.shift(), 'ERROR: controller busy', 2, false);
+  assert.match(page.elements.get('log').textContent, /Stop not delivered: ERROR: controller busy; motion may continue/);
+  assert.match(page.elements.get('log').textContent, /physical power disconnect/);
   assert.equal(page.evaluate('enabled'), false);
 });

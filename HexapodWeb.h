@@ -9,7 +9,6 @@
 
 namespace Hexapod
 {
-constexpr uint32_t WEB_TIMEOUT_MS = 500;
 constexpr uint32_t WEB_REQUEST_MAX_AGE_MS = 500;
 constexpr uint32_t AP_RETRY_MS = 5000;
 
@@ -17,7 +16,6 @@ struct WebMotion
 {
   float direction = 0;
   float rotation = 0;
-  uint32_t receivedMs = 0;
 };
 
 class ConsoleOutput : public Print

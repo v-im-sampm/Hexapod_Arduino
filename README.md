@@ -236,9 +236,11 @@ testservos
 
 `testservos` requires off mode and initialized drivers. It tests all eighteen joints in wiring order: **rf, rm, rr, lr, lm, lf**, with **coxa, femur, tibia** for each leg. Only the current joint receives pulses; previously tested joints and unused channels are disabled. Each joint moves through nominal **90 -> 85 -> 95 -> 90 degrees**, holding each angle for **1000 ms** before advancing. The existing pulse limits, trim and reversal apply. This is a small-range check, not an endpoint sweep or automatic calibration; even these angles must be checked for mechanical clearance first.
 
-The console reports each joint, board address, channel, nominal angle and commanded pulse width. `status` remains available. The non-blocking sequence normally takes about **72 seconds**; delayed loop servicing extends holds rather than skipping movements. These are commanded positions, not measured feedback, and completion does not certify that a servo moved correctly.
+After each leg's three joints finish, **all outputs are disabled and the sequence pauses indefinitely**. Use `retest` to repeat that same leg from its coxa, or `next` to start the next leg. You can retest a leg multiple times. The final **lf** leg also pauses: `retest` repeats it, and `next` finishes the sequence. These commands are accepted only at a leg pause, not during movement or outside the sequence.
 
-Send `off` or `!` to cancel and disable outputs, or `stop` to cancel while retaining the current joint's holding torque. **Normal completion disables all outputs and releases torque**, so keep the body supported throughout. Radio packets never interrupt or resume the sequence; `home`, `walk` or `radio` explicitly cancel it and enable all legs, which can move joints abruptly. Direct pose commands and configuration require leaving the sequence first. An I2C fault disables outputs and requires `init` before restarting. The sequence does not change or save settings.
+The console reports each joint, board address, channel, nominal angle and commanded pulse width, then prompts for `retest` or `next` at each pause. `status` remains available and identifies the paused leg and disabled outputs. Each leg takes about **12 seconds** of motion; all six take about **72 seconds**, excluding pauses and retests. The sequence is non-blocking; delayed loop servicing extends holds rather than skipping movements. These are commanded positions, not measured feedback, and completion does not certify that a servo moved correctly.
+
+Send `off` or `!` to cancel and disable outputs, or `stop` to cancel while retaining the active joint's holding torque; if already paused, `stop` cancels and leaves outputs disabled. **Every leg pause and normal completion releases torque**, so keep the body supported throughout. Radio packets never interrupt or resume the sequence; `home`, `walk` or `radio` explicitly cancel it, even while paused, and enable all legs, which can move joints abruptly. Direct pose commands and configuration require cancelling the sequence first. An I2C fault disables outputs and requires `init` before restarting. The sequence does not change or save settings.
 
 ## 7. Serial console reference
 
@@ -249,15 +251,17 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | Command | Effect |
 |---|---|
 | `help` | Command summary (while off) |
-| `status` | Mode, OE, driver/radio readiness, unsaved changes, MAC, latest RX values/age; while off/posing/testing servos, commanded pulses and current sequence step (not position feedback) |
+| `status` | Mode, OE, driver/radio readiness, unsaved changes, MAC, latest RX values/age; while off/posing/testing servos, commanded pulses and current sequence step or paused leg (not position feedback) |
 | `params` | All named parameter ranges (while off) |
 | `show` | All current parameters, leg origins and eighteen calibrations, displayed as commands (while off) |
 | `off` / `!` | Disable both PCA9685 outputs immediately; radio cannot re-enable them |
-| `stop` | Stop radio/manual walking and return toward home, retaining holding torque; leave a direct pose or off state unchanged |
+| `stop` | Stop radio/manual walking and return toward home; cancel a servo sequence holding the active joint, or stay disabled if paused; leave a direct pose or off state unchanged |
 | `center [all\|LEG]` | Hold nominal 90 degrees; default is all joints |
 | `servo LEG JOINT ANGLE` | Test one nominal angle, 0-180 degrees |
 | `pulse LEG JOINT US` | Test an integer pulse width within that servo's calibrated limits |
-| `testservos` | While off, test all eighteen joints one-by-one at nominal 90/85/95/90 degrees, 1000 ms per angle; disable outputs on completion; `stop` cancels holding the current joint |
+| `testservos` | While off, test joints one-by-one at nominal 90/85/95/90 degrees, 1000 ms per angle; pause with outputs disabled after each leg |
+| `retest` | At a servo-sequence pause, repeat all three joints of the just-tested leg; pause again afterward |
+| `next` | At a servo-sequence pause, test the next leg, or finish with outputs disabled after the final leg |
 | `joints LEG COXA FEMUR TIBIA` | Set all three nominal angles of one leg |
 | `foot LEG DX DY DZ` | Test one foot via IK; offsets from that leg's home in body coordinates, each -150..150 mm; unreachable targets/joint angles are rejected |
 | `home` | Enable all legs at the home stance; ignore radio |
@@ -351,7 +355,7 @@ Valid settings load automatically on boot, **but output enable state, pose, armi
 
 ## Validation
 
-The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, the complete one-servo-at-a-time sequence (angle order, 1000 ms holds, calibration, cancellation, radio isolation, control handovers, timer wraparound and I2C failures), saved-setting reboot/load/write failures, control-source transitions, the 10-second walking limit and recovery after I2C faults.
+The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, the complete one-servo-at-a-time sequence (angle order, 1000 ms holds, disabled pauses after every leg, repeated leg retests including the final leg, explicit advancement/completion, calibration, cancellation, radio isolation, control handovers, timer wraparound and I2C failures), saved-setting reboot/load/write failures, control-source transitions, the 10-second walking limit and recovery after I2C faults.
 
 Run the tests from a Visual Studio Developer PowerShell with MSVC installed:
 

@@ -135,20 +135,27 @@ void advanceServoTest()
   loop();
 }
 
-void testServoSequence()
+void checkServoTestPaused(size_t leg)
 {
-  send("testservos");
+  CHECK(mode == Mode::ServoTestPaused && Fake::outputEnable == HIGH);
+  CHECK(servoTest.servoIndex == (leg + 1) * JOINT_COUNT - 1);
+  CHECK(servoTest.step == 3);
+  for (auto& board : Fake::pwm)
+    for (uint16_t ticks : board)
+      CHECK(ticks == 4096);
+  for (auto& pulses : lastPulses)
+    for (uint16_t pulse : pulses)
+      CHECK(pulse == 0);
+}
+
+void runServoTestLeg(size_t leg)
+{
   const uint32_t started = servoTest.startedMs;
-  const unsigned saves = Fake::saves;
-  send("status");
-  CHECK(Serial.output.find("mode=testservos") != std::string::npos);
-  CHECK(Serial.output.find("rf coxa, address 0x40 channel 0") != std::string::npos);
-  receive("0,2047,0,2047,4095,2047,1,1,1,1");
-  CHECK(!control.armed && control.direction == 0 && control.rotation == 0);
   const uint16_t pulses[] = {1500, 1472, 1528, 1500};
-  for (size_t servo = 0; servo < 18; ++servo)
+  for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
     for (size_t step = 0; step < 4; ++step)
     {
+      const size_t servo = leg * JOINT_COUNT + joint;
       CHECK(servoTest.step == step);
       checkServoTestOutput(servo, pulses[step]);
       Fake::now = servoTest.startedMs + 999;
@@ -157,10 +164,42 @@ void testServoSequence()
       checkServoTestOutput(servo, pulses[step]);
       loop();
     }
+  checkServoTestPaused(leg);
+  CHECK(uint32_t(Fake::now - started) == 12001);
+  CHECK(Serial.output.find(std::string("Leg ") + LEG_NAMES[leg] + " test complete") != std::string::npos);
+}
+
+void testServoSequence()
+{
+  send("testservos");
+  const unsigned saves = Fake::saves;
+  send("status");
+  CHECK(Serial.output.find("mode=testservos") != std::string::npos);
+  CHECK(Serial.output.find("rf coxa, address 0x40 channel 0") != std::string::npos);
+  receive("0,2047,0,2047,4095,2047,1,1,1,1");
+  CHECK(!control.armed && control.direction == 0 && control.rotation == 0);
+  for (size_t leg = 0; leg < LEG_COUNT; ++leg)
+    for (unsigned attempt = 0; attempt < 3; ++attempt)
+    {
+      runServoTestLeg(leg);
+      if (leg + 1 == LEG_COUNT)
+      {
+        CHECK(Serial.output.find("lf tibia, address 0x41 channel 15") != std::string::npos);
+        CHECK(Serial.output.find("next finishes the sequence") != std::string::npos);
+      }
+      Fake::now += 5000;
+      loop();
+      checkServoTestPaused(leg);
+      send("status");
+      CHECK(Serial.output.find("mode=testservos-paused OE=HIGH") != std::string::npos);
+      CHECK(Serial.output.find(std::string("Leg ") + LEG_NAMES[leg] + " test complete") != std::string::npos);
+      receive("0,2047,0,2047,4095,2047,1,1,1,1");
+      CHECK(!control.armed && control.direction == 0 && control.rotation == 0);
+      checkServoTestPaused(leg);
+      send(attempt < 2 ? "retest" : "next");
+    }
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !control.armed);
-  CHECK(uint32_t(Fake::now - started) == 72001);
   CHECK(Fake::saves == saves);
-  CHECK(Serial.output.find("lf tibia, address 0x41 channel 15") != std::string::npos);
   CHECK(Serial.output.find("Servo test complete; outputs disabled") != std::string::npos);
   for (auto& board : Fake::pwm)
     for (uint16_t ticks : board)
@@ -174,6 +213,12 @@ void testServoSequence()
 
 void testServoTestControls()
 {
+  for (const char* command : {"next", "retest"})
+  {
+    send(command);
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+    CHECK(Serial.output.find("requires testservos paused") != std::string::npos);
+  }
   send("servo lf tibia 90");
   send("testservos");
   CHECK(mode == Mode::Pose && lastPulses[5][2] == 1500);
@@ -188,6 +233,12 @@ void testServoTestControls()
   {
     send(command);
     CHECK(Serial.output.find("off first") != std::string::npos);
+    checkServoTestOutput(0, 1500);
+  }
+  for (const char* command : {"next", "retest"})
+  {
+    send(command);
+    CHECK(Serial.output.find("requires testservos paused") != std::string::npos);
     checkServoTestOutput(0, 1500);
   }
   for (char character : std::string("servo rf"))
@@ -221,19 +272,72 @@ void testServoTestControls()
     {"home", Mode::Home}, {"radio", Mode::Radio}, {"walk 0.25 0 100", Mode::Walk}
   };
   for (const auto& handover : handovers)
+    for (bool paused : {false, true})
+    {
+      send("testservos");
+      if (paused)
+        runServoTestLeg(0);
+      send(handover.command);
+      CHECK(mode == handover.expected && Fake::outputEnable == LOW && !control.armed);
+      for (auto& leg : lastPulses)
+        for (uint16_t pulse : leg)
+          CHECK(pulse > 0);
+      send("testservos");
+      CHECK(mode == handover.expected && Serial.output.find("off first") != std::string::npos);
+      for (const char* command : {"next", "retest"})
+      {
+        send(command);
+        CHECK(mode == handover.expected && Serial.output.find("requires testservos paused") != std::string::npos);
+      }
+      Fake::now += 5000;
+      loop();
+      CHECK(mode != Mode::ServoTest && mode != Mode::ServoTestPaused);
+      send("off");
+    }
+}
+
+void testServoPausedControls()
+{
+  send("testservos");
+  runServoTestLeg(0);
+  const char* blocked[] = {"testservos", "servo lf tibia 90", "save", "init", "set step_length 30"};
+  for (const char* command : blocked)
+  {
+    send(command);
+    CHECK(Serial.output.find("off first") != std::string::npos);
+    checkServoTestPaused(0);
+  }
+  for (const char* command : {"next extra", "retest rf"})
+  {
+    send(command);
+    CHECK(Serial.output.find("ERROR") != std::string::npos);
+    checkServoTestPaused(0);
+  }
+  for (char character : std::string("ret"))
+    Serial.input.push_back(character);
+  Fake::now += 5000;
+  loop();
+  checkServoTestPaused(0);
+  send("est");
+  checkServoTestOutput(0, 1500);
+  runServoTestLeg(0);
+  send("off");
+
+  for (const char* cancel : {"off", "!", "stop"})
   {
     send("testservos");
-    send(handover.command);
-    CHECK(mode == handover.expected && Fake::outputEnable == LOW && !control.armed);
-    for (auto& leg : lastPulses)
-      for (uint16_t pulse : leg)
-        CHECK(pulse > 0);
-    send("testservos");
-    CHECK(mode == handover.expected && Serial.output.find("off first") != std::string::npos);
+    runServoTestLeg(0);
+    send(cancel);
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
     Fake::now += 5000;
     loop();
-    CHECK(mode != Mode::ServoTest);
-    send("off");
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+    for (const char* command : {"next", "retest"})
+    {
+      send(command);
+      CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+      CHECK(Serial.output.find("requires testservos paused") != std::string::npos);
+    }
   }
 }
 
@@ -248,6 +352,13 @@ void testServoTestTimingAndFaults()
   checkServoTestOutput(0, 1500);
   advanceServoTest();
   checkServoTestOutput(0, 1533);
+  for (int step = 0; step < 9; ++step)
+    advanceServoTest();
+  checkServoTestPaused(0);
+  send("retest");
+  checkServoTestOutput(0, 1533);
+  advanceServoTest();
+  checkServoTestOutput(0, 1567);
   send("off");
   send("defaults");
 
@@ -304,6 +415,34 @@ void testServoTestTimingAndFaults()
   CHECK(Serial.output.find("ERROR") != std::string::npos);
   Fake::writesUntilFailure = -1;
   send("init");
+
+  send("testservos");
+  for (int step = 0; step < 11; ++step)
+    advanceServoTest();
+  Fake::writeFailure = true;
+  advanceServoTest();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+  CHECK(Serial.output.find("Cannot disable tested servo") != std::string::npos);
+  Fake::writeFailure = false;
+  send("init");
+
+  for (const char* command : {"next", "retest"})
+  {
+    send("testservos");
+    runServoTestLeg(0);
+    Fake::writeFailure = true;
+    send(command);
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+    CHECK(Serial.output.find("ERROR") != std::string::npos);
+    for (auto& leg : lastPulses)
+      for (uint16_t pulse : leg)
+        CHECK(pulse == 0);
+    Fake::writeFailure = false;
+    send(command);
+    CHECK(mode == Mode::Off && Serial.output.find("requires testservos paused") != std::string::npos);
+    send("init");
+    CHECK(servosReady && mode == Mode::Off && Fake::outputEnable == HIGH);
+  }
 }
 
 void testMotionAndRecovery()
@@ -364,6 +503,7 @@ int main()
   testBootAndPoses();
   testServoSequence();
   testServoTestControls();
+  testServoPausedControls();
   testServoTestTimingAndFaults();
   testPersistence();
   testMotionAndRecovery();

@@ -305,7 +305,7 @@ void testConsole()
   const char* valid[] =
   {
     "help", "status", "show", "params", "save", "load", "defaults", "init", "scan",
-    "off", "stop", "home", "radio", "testservos", "center", "center all", "center lf",
+    "off", "stop", "home", "radio", "testservos", "next", "retest", "center", "center all", "center lf",
     "servo rf coxa 90", "pulse 0 0 1500", "joints RR 90 100 110",
     "foot lf -10 0 20", "walk 1 -0.5 10000", "walk 0 0 100",
     "set step_height 40", "cal lm femur 500 2500 -90 1", "origin rf 100 -60"
@@ -317,9 +317,14 @@ void testConsole()
   CHECK(command.values[0] == 45.5f);
   CHECK(consoleCommand("TESTSERVOS", command));
   CHECK(command.type == CommandType::TestServos);
+  CHECK(consoleCommand("NEXT", command));
+  CHECK(command.type == CommandType::Next);
+  CHECK(consoleCommand("RETEST", command));
+  CHECK(command.type == CommandType::Retest);
   const char* invalid[] =
   {
-    "", " ", "help extra", "testservos extra", "testservos rf coxa", "unknown",
+    "", " ", "help extra", "testservos extra", "testservos rf coxa",
+    "next extra", "retest rf", "unknown",
     "servo", "center bad", "servo 6 0 90",
     "servo rf 3 90", "servo rf coxa nan", "servo rf coxa inf", "servo rf coxa 181",
     "servo rf coxa -1", "pulse rf coxa 1500.1", "pulse rf coxa 2501",

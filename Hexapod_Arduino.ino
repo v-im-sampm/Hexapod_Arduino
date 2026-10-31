@@ -51,7 +51,7 @@ struct ServoTestState
   uint32_t startedMs = 0;
 };
 ServoTestState servoTest;
-enum class Mode { Off, Pose, Home, Radio, Walk, ServoTest };
+enum class Mode { Off, Pose, Home, Radio, Walk, ServoTest, ServoTestPaused };
 Mode mode = Mode::Off;
 bool servosReady = false;
 bool radioReady = false;
@@ -369,28 +369,66 @@ void print_servo_test_step()
       servoChannel(leg, joint), SERVO_TEST_ANGLES[servoTest.step], lastPulses[leg][joint]);
 }
 
+void print_servo_test_pause()
+{
+  const size_t leg = servoTest.servoIndex / JOINT_COUNT;
+  Serial.printf("Leg %s test complete; outputs disabled. Paused: retest repeats this leg; next %s.\n",
+      LEG_NAMES[leg], leg + 1 < LEG_COUNT ? "tests the next leg" : "finishes the sequence");
+}
+
+bool apply_servo_test_step()
+{
+  const size_t leg = servoTest.servoIndex / JOINT_COUNT;
+  const size_t joint = servoTest.servoIndex % JOINT_COUNT;
+  if (!write_servo(leg, joint, SERVO_TEST_ANGLES[servoTest.step]))
+    return false;
+  mode = Mode::ServoTest;
+  digitalWrite(SERVO_OE, LOW);
+  // Start a fresh hold after each write; delayed loops must not skip angles.
+  servoTest.startedMs = millis();
+  return true;
+}
+
 void start_servo_test()
 {
   if (!require_off() || !prepare_pose())
     return;
   servoTest = ServoTestState{};
-  if (!write_servo(0, 0, SERVO_TEST_ANGLES[0]))
+  if (!apply_servo_test_step())
     return;
-  mode = Mode::ServoTest;
-  digitalWrite(SERVO_OE, LOW);
-  servoTest.startedMs = millis();
   Serial.println("Servo test started: one joint at a time, 90/85/95/90 deg, 1000 ms each."
+                 " Pauses after each leg: retest repeats it, next advances."
                  " Support the robot; stop holds the current joint, !/off disables outputs.");
   print_servo_test_step();
+}
+
+void resume_servo_test(bool retest)
+{
+  if (mode != Mode::ServoTestPaused)
+  {
+    Serial.println("ERROR: next/retest requires testservos paused after a leg.");
+    return;
+  }
+  if (retest)
+    servoTest.servoIndex = (servoTest.servoIndex / JOINT_COUNT) * JOINT_COUNT;
+  else if (++servoTest.servoIndex == LEG_COUNT * JOINT_COUNT)
+  {
+    disable_outputs();
+    Serial.println("Servo test complete; outputs disabled. Radio remains ignored.");
+    return;
+  }
+  servoTest.step = 0;
+  if (apply_servo_test_step())
+    print_servo_test_step();
 }
 
 void update_servo_test(uint32_t now)
 {
   if (mode != Mode::ServoTest || uint32_t(now - servoTest.startedMs) < SERVO_TEST_STEP_MS)
     return;
-  size_t leg = servoTest.servoIndex / JOINT_COUNT;
-  size_t joint = servoTest.servoIndex % JOINT_COUNT;
-  if (++servoTest.step == SERVO_TEST_STEP_COUNT)
+  const size_t leg = servoTest.servoIndex / JOINT_COUNT;
+  const size_t joint = servoTest.servoIndex % JOINT_COUNT;
+  if (servoTest.step + 1 == SERVO_TEST_STEP_COUNT)
   {
     digitalWrite(SERVO_OE, HIGH);
     if (pwm[servoBoard(leg)].setPWM(servoChannel(leg, joint), 0, 4096) != 0)
@@ -399,22 +437,19 @@ void update_servo_test(uint32_t now)
       return;
     }
     lastPulses[leg][joint] = 0;
-    if (++servoTest.servoIndex == LEG_COUNT * JOINT_COUNT)
+    if (joint + 1 == JOINT_COUNT)
     {
-      disable_outputs();
-      Serial.println("Servo test complete; outputs disabled. Radio remains ignored.");
+      mode = Mode::ServoTestPaused;
+      print_servo_test_pause();
       return;
     }
+    ++servoTest.servoIndex;
     servoTest.step = 0;
-    leg = servoTest.servoIndex / JOINT_COUNT;
-    joint = servoTest.servoIndex % JOINT_COUNT;
   }
-  if (!write_servo(leg, joint, SERVO_TEST_ANGLES[servoTest.step]))
-    return;
-  digitalWrite(SERVO_OE, LOW);
-  // Start a fresh hold after each write; delayed loops must not skip angles.
-  servoTest.startedMs = millis();
-  print_servo_test_step();
+  else
+    ++servoTest.step;
+  if (apply_servo_test_step())
+    print_servo_test_step();
 }
 
 bool enter_home()
@@ -424,7 +459,8 @@ bool enter_home()
     Serial.println("ERROR: servo drivers not ready; use init.");
     return false;
   }
-  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest)
+  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest ||
+      mode == Mode::ServoTestPaused)
   {
     digitalWrite(SERVO_OE, HIGH);
     rebuild_geometry();
@@ -439,9 +475,9 @@ bool enter_home()
 
 void print_status()
 {
-  const char* names[] = {"off", "pose", "home", "radio", "walk", "testservos"};
+  const char* names[] = {"off", "pose", "home", "radio", "walk", "testservos", "testservos-paused"};
   Serial.printf("mode=%s OE=%s drivers=%s radio=%s unsaved=%s MAC=%s\n",
-      names[size_t(mode)], mode == Mode::Off ? "HIGH" : "LOW",
+      names[size_t(mode)], mode == Mode::Off || mode == Mode::ServoTestPaused ? "HIGH" : "LOW",
       servosReady ? "ready" : "init-needed", radioReady ? "ready" : "init-needed",
       settingsDirty ? "yes" : "no", WiFi.macAddress().c_str());
   Serial.printf("armed=%u direction=%.2f rotation=%.2f configured-channel=%u\n", control.armed,
@@ -457,7 +493,10 @@ void print_status()
     Serial.println("No valid RX packet since initialization.");
   if (mode == Mode::ServoTest)
     print_servo_test_step();
-  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest)
+  else if (mode == Mode::ServoTestPaused)
+    print_servo_test_pause();
+  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest ||
+      mode == Mode::ServoTestPaused)
     for (size_t leg = 0; leg < LEG_COUNT; ++leg)
       Serial.printf("%s commanded us (0=off): %u %u %u\n", LEG_NAMES[leg],
                     lastPulses[leg][0], lastPulses[leg][1], lastPulses[leg][2]);
@@ -471,6 +510,7 @@ void print_help()
       "  off | ! (immediate disable; finish with newline) | stop (return home if walking)\n"
       "  center [all|LEG] | servo LEG JOINT ANGLE | pulse LEG JOINT US\n"
       "  testservos (while off; one joint at a time, 90/85/95/90 deg, 1000 ms each)\n"
+      "  next | retest (only at the pause after each leg; outputs disabled while paused)\n"
       "  joints LEG COXA FEMUR TIBIA | foot LEG DX DY DZ (offset mm from home)\n"
       "  home | radio | walk DIRECTION ROTATION DURATION_MS (100..10000)\n"
       "  set NAME VALUE | cal LEG JOINT MIN_US MAX_US TRIM REVERSE\n"
@@ -478,7 +518,8 @@ void print_help()
       "LEG=rf/rm/rr/lr/lm/lf or 0..5; JOINT=coxa/femur/tibia or 0..2.\n"
       "Use off before configuration, storage, scan, init, help, params or show.\n"
       "Direct joint tests require off/pose. walk/home/radio explicitly take control.\n"
-      "stop cancels testservos holding the current joint; completion disables outputs.\n"
+      "next advances/finishes testservos; retest repeats the paused leg.\n"
+      "stop cancels testservos holding the active joint or staying off if paused.\n"
       "Only save writes settings. Boot always stays off; !/off releases torque.");
 }
 
@@ -536,6 +577,12 @@ void execute_command(const Command& command)
       mode = Mode::Pose;
       servoTest = ServoTestState{};
     }
+    else if (mode == Mode::ServoTestPaused)
+    {
+      disable_outputs();
+      Serial.println("Servo test cancelled; outputs remain disabled.");
+      return;
+    }
     control = ControlState{};
     Serial.println("Motion stopped; current pose/home held unless outputs were already off.");
     return;
@@ -543,6 +590,11 @@ void execute_command(const Command& command)
   if (command.type == CommandType::TestServos)
   {
     start_servo_test();
+    return;
+  }
+  if (command.type == CommandType::Next || command.type == CommandType::Retest)
+  {
+    resume_servo_test(command.type == CommandType::Retest);
     return;
   }
   if (command.type == CommandType::Home || command.type == CommandType::Radio ||

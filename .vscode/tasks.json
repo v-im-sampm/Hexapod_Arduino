@@ -38,7 +38,7 @@
 				"-File",
 				"${workspaceFolder}\\tools\\flash.ps1",
 				"-Port",
-				"${input:hexapodPort}"
+				"COM12"
 			],
 			"problemMatcher": [],
 			"options": {
@@ -87,7 +87,7 @@
 				"${workspaceFolder}\\tools\\flash.ps1",
 				"-MonitorOnly",
 				"-Port",
-				"${input:hexapodPort}"
+				"COM12"
 			],
 			"problemMatcher": [],
 			"options": {

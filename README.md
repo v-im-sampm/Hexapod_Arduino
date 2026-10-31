@@ -140,11 +140,13 @@ The tasks in [.vscode/tasks.json](.vscode/tasks.json) launch **Windows PowerShel
 | Task | Purpose |
 |---|---|
 | **Hexapod: Build** | Build without a connected board; also available through Ctrl+Shift+B |
-| **Hexapod: Flash + Serial Console** | Prompt for COM port, build, upload, then accept serial input |
+| **Hexapod: Flash + Serial Console** | Build, upload to hard-coded **COM12**, then accept serial input on **COM12** (no port prompt) |
 | **Hexapod: Upload Only (COM12)** | Upload existing build artifacts to hard-coded **COM12**, without building or opening a monitor |
 | **Hexapod: Serial Console** | Prompt for COM port and reconnect without building/flashing |
 
 Use **Hexapod: Build** at least once before **Hexapod: Upload Only (COM12)**. Upload-only uses the existing binaries in [.build/esp32](.build/esp32), not the current source: rebuild first if you want to include code changes. Keep servo power disconnected and close any serial monitor using COM12 before uploading.
+
+The ESP32 board package already requests automatic bootloader entry (`--before default-reset`) and a normal restart after upload (`--after hard-reset`). This uses the USB-to-serial adapter's DTR/RTS signals; it does not require the running sketch to cooperate. A manual BOOT press should not be needed on a board with working auto-reset circuitry. If BOOT is still required, close other serial monitors and check the board's DTR/RTS-to-GPIO0/EN reset circuit. A CP210x USB adapter alone does not guarantee those connections are present or reliable. See Espressif's [automatic bootloader guidance](https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/boot-mode-selection.html#automatic-bootloader), including its Windows-specific reset-circuit notes. A task setting cannot replace missing or faulty reset hardware.
 
 Alternatively, in a **Windows PowerShell** terminal opened at the repository root:
 
@@ -424,6 +426,6 @@ The flashing-workflow tests use a fake CLI, so no board is needed and nothing is
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_flash.ps1
 ```
 
-[tests/test_flash.ps1](tests/test_flash.ps1) checks build/upload/monitor ordering, the upload-only task fixed to COM12 (no build or monitor), use of the same build artifacts, paths containing spaces, COM validation, failure propagation, monitor-only mode and forwarding typed input to the monitor.
+[tests/test_flash.ps1](tests/test_flash.ps1) checks build/upload/monitor ordering, the flash-and-console task fixed to COM12, the upload-only task fixed to COM12 (no build or monitor), use of the same build artifacts, paths containing spaces, COM validation, failure propagation, monitor-only mode and forwarding typed input to the monitor.
 
 Original authors: Ozgur Toprak Onsoy and Emre Kalem. See [LICENSE](LICENSE). The supplied [ESP-NOW examples](espnow/) are retained as transmitter/protocol references; their bulldozer motor and LED logic is not part of the hexapod firmware.

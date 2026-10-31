@@ -104,6 +104,14 @@ function Run-Case {
 
 try {
     $tasks = Get-Content -LiteralPath (Join-Path $repoRoot '.vscode\tasks.json') -Raw | ConvertFrom-Json
+    $flashTasks = @($tasks.tasks | Where-Object { $_.label -eq 'Hexapod: Flash + Serial Console' })
+    Assert-True ($flashTasks.Count -eq 1) 'Flash + Serial Console task is missing or duplicated.'
+    $flashTask = $flashTasks[0]
+    Assert-True ($flashTask.args -contains '${workspaceFolder}\tools\flash.ps1') 'Flash + Serial Console task does not use the flash script.'
+    $flashPortIndex = [Array]::IndexOf($flashTask.args, '-Port')
+    Assert-True ($flashPortIndex -ge 0 -and $flashTask.args[$flashPortIndex + 1] -eq 'COM12') 'Flash + Serial Console task must use COM12 without prompting.'
+    $flashOptions = $flashTask.args[$flashPortIndex..($flashTask.args.Count - 1)]
+    Run-Case -Options $flashOptions -ExpectedCommands @('compile', 'upload', 'monitor') -ExpectedPort 'COM12' -CheckInput $true
     $uploadTasks = @($tasks.tasks | Where-Object { $_.label -eq 'Hexapod: Upload Only (COM12)' })
     Assert-True ($uploadTasks.Count -eq 1) 'Upload-only task is missing or duplicated.'
     $uploadTask = $uploadTasks[0]
@@ -126,7 +134,7 @@ try {
     Run-Case -Options @('-UploadOnly', '-Port', 'COM0') -ExpectedCommands @() -Success $false
     Run-Case -Options @('-UploadOnly', '-BuildOnly') -ExpectedCommands @() -Success $false
     Run-Case -Options @('-UploadOnly', '-MonitorOnly') -ExpectedCommands @() -Success $false
-    Write-Host 'PASS: flash stages, COM12 upload-only task, artifact paths, failure handling, COM validation and interactive monitor stdin.'
+    Write-Host 'PASS: flash stages, COM12 flash/console and upload-only tasks, artifact paths, failure handling, COM validation and interactive monitor stdin.'
 } finally {
     foreach ($name in $variableNames) {
         [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')

@@ -58,7 +58,7 @@ OE is active-low: GPIO23 LOW enables pulses; HIGH disables both boards. Add an *
          |     +---[1 kOhm]--- ESP32 3V3
          |
          |               V+ NOT CONNECTED           V+ NOT CONNECTED
-         |               S0-S8 --> right legs       S7-S15 --> left legs
+         |               S7-S15 --> right legs      S0-S8 --> left legs
          |
          +--------------------------- COMMON GROUND
                                       |
@@ -101,16 +101,18 @@ Left/right are from the robot's perspective, looking forward. The coordinate con
 
 Channel numbers are the **printed, zero-based PCA9685 channel labels**, not ESP32 GPIO numbers.
 
+The **right side starts at channel 7** on board #1 (0x40): RF coxa 7, femur 8, tibia 9. The **left side starts at channel 0** on board #2 (0x41), beginning with the left rear leg.
+
 | Leg | Firmware index | Board / address | Coxa signal | Femur signal | Tibia signal |
 |---|---:|---|---:|---:|---:|
-| Right front (RF) | 0 | #1 / 0x40 | 0 | 1 | 2 |
-| Right middle (RM) | 1 | #1 / 0x40 | 3 | 4 | 5 |
-| Right rear (RR) | 2 | #1 / 0x40 | 6 | 7 | 8 |
-| Left rear (LR) | 3 | #2 / 0x41 | 7 | 8 | 9 |
-| Left middle (LM) | 4 | #2 / 0x41 | 10 | 11 | 12 |
-| Left front (LF) | 5 | #2 / 0x41 | 13 | 14 | 15 |
+| Right front (RF) | 0 | #1 / 0x40 | 7 | 8 | 9 |
+| Right middle (RM) | 1 | #1 / 0x40 | 10 | 11 | 12 |
+| Right rear (RR) | 2 | #1 / 0x40 | 13 | 14 | 15 |
+| Left rear (LR) | 3 | #2 / 0x41 | 0 | 1 | 2 |
+| Left middle (LM) | 4 | #2 / 0x41 | 3 | 4 | 5 |
+| Left front (LF) | 5 | #2 / 0x41 | 6 | 7 | 8 |
 
-Channels **9-15 on board #1 (0x40)** and **0-6 on board #2 (0x41)** are unused and disabled. Every servo's red and brown/black wires connect to the external power harness described above, regardless of its signal channel.
+Channels **0-6 on board #1 (0x40)** and **9-15 on board #2 (0x41)** are unused and disabled. Every servo's red and brown/black wires connect to the external power harness described above, regardless of its signal channel.
 
 ## 4. Build and upload
 

@@ -38,9 +38,11 @@ void testBootAndPoses()
   CHECK(mode == Mode::Off && !control.armed);
   send("servo rf coxa 90");
   CHECK(mode == Mode::Pose && Fake::outputEnable == LOW);
-  CHECK(Fake::pwm[0][0] == 307 && Fake::pwm[0][1] == 4096 && Fake::pwm[1][0] == 4096);
+  CHECK(Fake::pwm[0][7] == 307 && Fake::pwm[0][8] == 4096 &&
+        Fake::pwm[0][0] == 4096 && Fake::pwm[1][0] == 4096);
   send("pulse rf femur 1600");
   CHECK(lastPulses[0][0] == 1500 && lastPulses[0][1] == 1600);
+  CHECK(Fake::pwm[0][8] == 328 && Fake::pwm[0][7] == 307 && Fake::pwm[0][1] == 4096);
   send("pulse rf femur 2300");
   CHECK(lastPulses[0][1] == 1600 && Serial.output.find("ERROR") != std::string::npos);
   send("set step_length 30");
@@ -48,15 +50,19 @@ void testBootAndPoses()
   send("save");
   CHECK(Fake::saves == 0);
   send("off");
+  send("servo rr tibia 90");
+  CHECK(Fake::pwm[0][15] == 307 && Fake::pwm[0][7] == 4096 && Fake::pwm[1][0] == 4096);
+  send("off");
   send("servo lr coxa 90");
-  CHECK(Fake::pwm[1][7] == 307 && Fake::pwm[1][0] == 4096 && Fake::pwm[0][0] == 4096);
+  CHECK(Fake::pwm[1][0] == 307 && Fake::pwm[1][7] == 4096 && Fake::pwm[0][7] == 4096);
   send("off");
   send("servo lf tibia 90");
-  CHECK(Fake::pwm[1][15] == 307 && Fake::pwm[1][7] == 4096 && Fake::pwm[0][0] == 4096);
+  CHECK(Fake::pwm[1][8] == 307 && Fake::pwm[1][0] == 4096 &&
+        Fake::pwm[1][15] == 4096 && Fake::pwm[0][7] == 4096);
   send("center all");
   for (size_t board = 0; board < DRIVER_COUNT; ++board)
     for (size_t channel = 0; channel < 16; ++channel)
-      CHECK(Fake::pwm[board][channel] == ((board == 0 ? channel < 9 : channel >= 7) ? 307 : 4096));
+      CHECK(Fake::pwm[board][channel] == ((board == 0 ? channel >= 7 : channel < 9) ? 307 : 4096));
   send("off");
   send("foot rf 0 0 0");
   CHECK(mode == Mode::Pose && lastPulses[0][0] == 1500 && lastPulses[0][2] > 0);
@@ -175,7 +181,7 @@ void testServoSequence()
   const unsigned saves = Fake::saves;
   send("status");
   CHECK(Serial.output.find("mode=testservos") != std::string::npos);
-  CHECK(Serial.output.find("rf coxa, address 0x40 channel 0") != std::string::npos);
+  CHECK(Serial.output.find("rf coxa, address 0x40 channel 7") != std::string::npos);
   receive("0,2047,0,2047,4095,2047,1,1,1,1");
   CHECK(!control.armed && control.direction == 0 && control.rotation == 0);
   for (size_t leg = 0; leg < LEG_COUNT; ++leg)
@@ -184,7 +190,7 @@ void testServoSequence()
       runServoTestLeg(leg);
       if (leg + 1 == LEG_COUNT)
       {
-        CHECK(Serial.output.find("lf tibia, address 0x41 channel 15") != std::string::npos);
+        CHECK(Serial.output.find("lf tibia, address 0x41 channel 8") != std::string::npos);
         CHECK(Serial.output.find("next finishes the sequence") != std::string::npos);
       }
       Fake::now += 5000;
@@ -411,7 +417,7 @@ void testServoTestTimingAndFaults()
   Fake::writesUntilFailure = 1;
   advanceServoTest();
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
-  CHECK(Fake::pwm[0][0] == 4096 && Fake::pwm[0][1] == 4096);
+  CHECK(Fake::pwm[0][7] == 4096 && Fake::pwm[0][8] == 4096);
   CHECK(Serial.output.find("ERROR") != std::string::npos);
   Fake::writesUntilFailure = -1;
   send("init");

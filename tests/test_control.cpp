@@ -147,8 +147,8 @@ void testControl()
 void testServos()
 {
   const uint8_t expectedChannels[LEG_COUNT][JOINT_COUNT] = {
-    {0, 1, 2}, {3, 4, 5}, {6, 7, 8},
-    {7, 8, 9}, {10, 11, 12}, {13, 14, 15}
+    {7, 8, 9}, {10, 11, 12}, {13, 14, 15},
+    {0, 1, 2}, {3, 4, 5}, {6, 7, 8}
   };
   bool used[DRIVER_COUNT][16] = {};
   for (size_t leg = 0; leg < LEG_COUNT; ++leg)
@@ -164,7 +164,7 @@ void testServos()
   }
   for (size_t board = 0; board < DRIVER_COUNT; ++board)
     for (size_t channel = 0; channel < 16; ++channel)
-      CHECK(used[board][channel] == (board == 0 ? channel < 9 : channel >= 7));
+      CHECK(used[board][channel] == (board == 0 ? channel >= 7 : channel < 9));
 
   ServoCalibration calibration;
   uint16_t pulse = 0;

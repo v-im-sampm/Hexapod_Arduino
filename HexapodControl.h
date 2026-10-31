@@ -174,7 +174,7 @@ inline size_t servoBoard(size_t legIndex)
 
 inline uint8_t servoChannel(size_t legIndex, size_t jointIndex)
 {
-  return uint8_t((legIndex % 3) * JOINT_COUNT + jointIndex + (legIndex < 3 ? 0 : 7));
+  return uint8_t((legIndex % 3) * JOINT_COUNT + jointIndex + (legIndex < 3 ? 7 : 0));
 }
 
 inline bool servoPulse(float angle, const ServoCalibration& calibration, uint16_t& pulseUs)

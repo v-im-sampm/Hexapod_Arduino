@@ -16,6 +16,59 @@ constexpr uint32_t CONTROL_TIMEOUT_MS = 500;
 constexpr uint16_t STICK_CENTER = 2047;
 constexpr uint16_t STICK_DEADZONE = 100;
 
+struct ServoCalibration
+{
+  uint16_t minUs = 1000;
+  uint16_t maxUs = 2000;
+  float trimDegrees = 0.0f;
+  uint8_t reversed = 0;
+};
+
+struct LegOrigin
+{
+  float x;
+  float y;
+};
+
+struct Settings
+{
+  float coxaLength = 38.0f;
+  float femurLength = 86.25f;
+  float tibiaLength = 160.5f;
+  float stepLength = 60.0f;
+  float stepHeight = 100.0f;
+  float homeZ = -40.0f;
+  float smoothing = 0.4f;
+  float rotationStep = 15.0f;
+  float phaseStep = 0.015f;
+  float coxaMin = 45.0f;
+  float coxaMax = 135.0f;
+  float servoHz = 50.0f;
+  uint32_t updateMs = 10;
+  uint32_t oscillator0Hz = 25000000;
+  uint32_t oscillator1Hz = 25000000;
+  uint32_t i2cHz = 400000;
+  uint32_t radioChannel = ESPNOW_CHANNEL;
+  uint32_t timeoutMs = CONTROL_TIMEOUT_MS;
+  uint32_t stickCenter = STICK_CENTER;
+  uint32_t stickDeadzone = STICK_DEADZONE;
+  uint32_t throttleChannel = 2;
+  uint32_t steeringChannel = 4;
+  uint32_t throttleReversed = 0;
+  uint32_t steeringReversed = 0;
+  LegOrigin origins[LEG_COUNT] =
+  {
+    {100.94f, -57.11f}, {0.0f, -105.72f}, {-100.94f, -57.11f},
+    {-100.94f, 57.11f}, {0.0f, 105.72f}, {100.94f, 57.11f}
+  };
+  ServoCalibration servos[LEG_COUNT][JOINT_COUNT] = {};
+
+  uint32_t oscillatorHz(size_t board) const
+  {
+    return board == 0 ? oscillator0Hz : oscillator1Hz;
+  }
+};
+
 struct ControlPacket
 {
   uint16_t channels[CONTROL_CHANNEL_COUNT] = {};
@@ -64,11 +117,12 @@ inline bool parseControlPacket(const uint8_t* data, size_t length, ControlPacket
   return true;
 }
 
-inline float stickCommand(uint16_t value)
+inline float stickCommand(uint16_t value, uint32_t center = STICK_CENTER,
+                          uint32_t deadzone = STICK_DEADZONE)
 {
-  if (value < STICK_CENTER - STICK_DEADZONE)
+  if (value < center - deadzone)
     return 1.0f;
-  if (value > STICK_CENTER + STICK_DEADZONE)
+  if (value > center + deadzone)
     return -1.0f;
   return 0.0f;
 }
@@ -81,25 +135,27 @@ struct ControlState
   bool hasSignal = false;
   uint32_t lastPacketMs = 0;
 
-  bool expire(uint32_t now)
+  bool expire(uint32_t now, uint32_t timeoutMs = CONTROL_TIMEOUT_MS)
   {
-    if (!hasSignal || uint32_t(now - lastPacketMs) < CONTROL_TIMEOUT_MS)
+    if (!hasSignal || uint32_t(now - lastPacketMs) < timeoutMs)
       return false;
     direction = rotation = 0.0f;
     armed = hasSignal = false;
     return true;
   }
 
-  bool receive(const ControlPacket& packet, uint32_t now)
+  bool receive(const ControlPacket& packet, uint32_t now, const Settings& settings = Settings{})
   {
-    expire(now);
-    if (uint32_t(now - packet.receivedAtMs) >= CONTROL_TIMEOUT_MS)
+    expire(now, settings.timeoutMs);
+    if (uint32_t(now - packet.receivedAtMs) >= settings.timeoutMs)
       return false;
 
     lastPacketMs = packet.receivedAtMs;
     hasSignal = true;
-    const float nextDirection = stickCommand(packet.channels[2]);
-    const float nextRotation = stickCommand(packet.channels[4]);
+    const float nextDirection = stickCommand(packet.channels[settings.throttleChannel],
+        settings.stickCenter, settings.stickDeadzone) * (settings.throttleReversed ? -1 : 1);
+    const float nextRotation = stickCommand(packet.channels[settings.steeringChannel],
+        settings.stickCenter, settings.stickDeadzone) * (settings.steeringReversed ? -1 : 1);
     if (!armed && nextDirection == 0.0f && nextRotation == 0.0f)
       armed = true;
     if (armed)
@@ -109,14 +165,6 @@ struct ControlState
     }
     return true;
   }
-};
-
-struct ServoCalibration
-{
-  uint16_t minUs = 1000;
-  uint16_t maxUs = 2000;
-  float trimDegrees = 0.0f;
-  bool reversed = false;
 };
 
 inline size_t servoBoard(size_t legIndex)
@@ -133,7 +181,7 @@ inline bool servoPulse(float angle, const ServoCalibration& calibration, uint16_
 {
   if (!isfinite(angle) || !isfinite(calibration.trimDegrees) ||
       calibration.minUs < 500 || calibration.maxUs > 2500 ||
-      calibration.minUs >= calibration.maxUs)
+      calibration.minUs >= calibration.maxUs || calibration.reversed > 1)
     return false;
 
   if (calibration.reversed)

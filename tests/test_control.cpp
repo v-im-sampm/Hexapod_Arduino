@@ -1,4 +1,4 @@
-#include "../HexapodControl.h"
+#include "../HexapodConsole.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,10 +206,161 @@ void testServos()
   CHECK(!servoPulse(90, calibration, pulse));
 }
 
+void testSettings()
+{
+  Settings settings;
+  const char* error = nullptr;
+  CHECK(validateSettings(settings, error));
+  CHECK(setParameter(settings, "step_length", "42.5", error) && settings.stepLength == 42.5f);
+  CHECK(setParameter(settings, "oscillator0_hz", "25000001", error));
+  CHECK(settings.oscillatorHz(0) == 25000001 && settings.oscillatorHz(1) == 25000000);
+  CHECK(!setParameter(settings, "step_length", "nan", error) && settings.stepLength == 42.5f);
+  CHECK(!setParameter(settings, "timeout_ms", "1e3", error));
+  CHECK(!setParameter(settings, "timeout_ms", "-1", error));
+  CHECK(!setParameter(settings, "timeout_ms", "500.1", error));
+  CHECK(!setParameter(settings, "timeout_ms", "42949672960", error));
+  CHECK(!setParameter(settings, "timeout_ms", "500junk", error));
+  CHECK(!setParameter(settings, "missing", "42", error));
+  for (const FloatParameter& parameter : FLOAT_PARAMETERS)
+  {
+    Settings bad = settings;
+    bad.*(parameter.member) = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!validateSettings(bad, error));
+    bad.*(parameter.member) = parameter.maximum + 1;
+    CHECK(!validateSettings(bad, error));
+    bad.*(parameter.member) = parameter.minimum - 1;
+    CHECK(!validateSettings(bad, error));
+  }
+  for (const IntegerParameter& parameter : INTEGER_PARAMETERS)
+  {
+    Settings bad = settings;
+    bad.*(parameter.member) = parameter.maximum + 1;
+    CHECK(!validateSettings(bad, error));
+  }
+  CHECK(!setParameter(settings, "coxa_min", "135", error));
+  CHECK(!setParameter(settings, "stick_center", "10", error));
+  CHECK(!setParameter(settings, "throttle_channel", "4", error));
+  CHECK(!setParameter(settings, "home_z", "-200", error));
+  Settings bad = settings;
+  bad.origins[4] = {0, 0};
+  CHECK(!validateSettings(bad, error));
+  bad = settings;
+  bad.servos[5][2].reversed = 255;
+  CHECK(!validateSettings(bad, error));
+  bad = settings;
+  bad.servos[1][1].trimDegrees = 91;
+  CHECK(!validateSettings(bad, error));
+
+  settings.servos[5][2] = {800, 2200, 4.5f, 1};
+  settings.origins[0] = {103, -60};
+  const SettingsRecord saved = makeSettingsRecord(settings);
+  Settings loaded;
+  CHECK(decodeSettings(&saved, sizeof(saved), loaded, error));
+  CHECK(loaded.stepLength == 42.5f && loaded.oscillator0Hz == 25000001);
+  CHECK(loaded.servos[5][2].minUs == 800 && loaded.servos[5][2].reversed == 1);
+  CHECK(loaded.origins[0].x == 103 && loaded.origins[0].y == -60);
+  CHECK(!decodeSettings(&saved, sizeof(saved) - 1, loaded, error));
+  CHECK(!decodeSettings(nullptr, sizeof(saved), loaded, error));
+  SettingsRecord corrupt = saved;
+  corrupt.version++;
+  CHECK(!decodeSettings(&corrupt, sizeof(corrupt), loaded, error));
+  corrupt = saved;
+  corrupt.settings.stepLength = 999;
+  CHECK(!decodeSettings(&corrupt, sizeof(corrupt), loaded, error));
+  corrupt.checksum = settingsChecksum(corrupt.settings);
+  CHECK(!decodeSettings(&corrupt, sizeof(corrupt), loaded, error));
+  CHECK(loaded.stepLength == 42.5f); // Failed loads never partially apply.
+
+  CHECK(setParameter(settings, "timeout_ms", "200", error));
+  CHECK(setParameter(settings, "stick_center", "2000", error));
+  CHECK(setParameter(settings, "stick_deadzone", "50", error));
+  CHECK(setParameter(settings, "throttle_channel", "1", error));
+  CHECK(setParameter(settings, "throttle_reverse", "1", error));
+  ControlState state;
+  ControlPacket packet = packetAt(100);
+  packet.channels[1] = 2000;
+  packet.channels[4] = 2000;
+  CHECK(state.receive(packet, 100, settings) && state.armed);
+  packet.receivedAtMs = 120;
+  packet.channels[1] = 0;
+  CHECK(state.receive(packet, 120, settings) && state.direction == -1);
+  CHECK(!state.expire(319, settings.timeoutMs));
+  CHECK(state.expire(320, settings.timeoutMs));
+}
+
+bool consoleCommand(const std::string& text, Command& command)
+{
+  std::string copy = text;
+  const char* error = nullptr;
+  return parseCommand(&copy[0], command, error);
+}
+
+void testConsole()
+{
+  Command command;
+  const char* valid[] =
+  {
+    "help", "status", "show", "params", "save", "load", "defaults", "init", "scan",
+    "off", "stop", "home", "radio", "center", "center all", "center lf",
+    "servo rf coxa 90", "pulse 0 0 1500", "joints RR 90 100 110",
+    "foot lf -10 0 20", "walk 1 -0.5 10000", "walk 0 0 100",
+    "set step_height 40", "cal lm femur 500 2500 -90 1", "origin rf 100 -60"
+  };
+  for (const char* text : valid)
+    CHECK(consoleCommand(text, command));
+  CHECK(consoleCommand("SERVO LF TIBIA 45.5", command));
+  CHECK(command.type == CommandType::Servo && command.leg == 5 && command.joint == 2);
+  CHECK(command.values[0] == 45.5f);
+  const char* invalid[] =
+  {
+    "", " ", "help extra", "unknown", "servo", "center bad", "servo 6 0 90",
+    "servo rf 3 90", "servo rf coxa nan", "servo rf coxa inf", "servo rf coxa 181",
+    "servo rf coxa -1", "pulse rf coxa 1500.1", "pulse rf coxa 2501",
+    "walk 1 0", "walk 1 0 10001", "walk 1 0 99", "walk 1 0 -100",
+    "walk 2 0 1000", "walk 0 -2 1000", "walk 1 0 1000 extra", "walk 1 0 99999999999999999",
+    "cal rf coxa 2000 1000 0 0", "cal rf coxa 1000 2000 91 0",
+    "cal rf coxa 1000 2000 0 2", "cal rf coxa 1000 2000 0 0 extra",
+    "foot lf 151 0 0", "origin rf 501 0", "joints rf 90 90",
+    "set step_height", "a b c d e f g h i"
+  };
+  for (const char* text : invalid)
+    CHECK(!consoleCommand(text, command));
+
+  ConsoleLine line;
+  for (char character : std::string("help\r\n"))
+  {
+    const LineEvent event = line.push(character);
+    if (character == '\r')
+      CHECK(event == LineEvent::Ready && strcmp(line.data, "help") == 0);
+    else
+      CHECK(event == LineEvent::None);
+  }
+  for (size_t i = 0; i < sizeof(line.data) - 1; ++i)
+    CHECK(line.push('a') == LineEvent::None);
+  CHECK(line.push('a') == LineEvent::Overflow);
+  for (char character : std::string("servo rf coxa 90\n"))
+    CHECK(line.push(character) == LineEvent::None);
+  CHECK(line.push('!') == LineEvent::Disable);
+  CHECK(line.push('s') == LineEvent::None);
+  CHECK(line.push('\n') == LineEvent::None);
+  CHECK(line.push('\0') == LineEvent::Invalid);
+  CHECK(line.push('\n') == LineEvent::None);
+  CHECK(line.push('x') == LineEvent::None);
+  CHECK(line.push('\b') == LineEvent::None);
+  CHECK(line.push('h') == LineEvent::None);
+  CHECK(line.push('\n') == LineEvent::Ready && strcmp(line.data, "h") == 0);
+
+  TimedMotion motion{1, -1, UINT32_MAX - 10, 10000};
+  CHECK(!motion.expired(uint32_t(motion.startedMs + 9999)));
+  CHECK(motion.expired(uint32_t(motion.startedMs + 10000)));
+}
+
 int main()
 {
   testProtocol();
   testControl();
   testServos();
-  puts("PASS: CSV protocol, stick mapping, arming/failsafe, servo mapping and PWM conversion.");
+  testSettings();
+  testConsole();
+  puts("PASS: protocol, failsafe, servo output, runtime settings, console parsing and saved records.");
 }

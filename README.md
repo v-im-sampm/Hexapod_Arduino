@@ -121,14 +121,57 @@ Channels **9-15 on both boards are unused and disabled**. Every servo's red and 
 5. Upload once; no source editing or reflashing is needed for normal calibration or parameter tuning.
 6. Upload with servo power off. Open Serial Monitor at **115200 baud**, select **Newline** or **Both NL & CR**, then reset. Boot loads saved settings if valid, initializes the drivers, and stays **off**. Type `help`. The receiver's **STA MAC address** is printed before PCA9685 initialization, so it can be read even with the drivers disconnected. Opening the serial port may reset some development boards; this also returns outputs to off.
 
-CLI equivalent (from the repository directory; replace `COM5` with your port):
+### Flash and open the console from VS Code
+
+Connect the ESP32 over USB, keep servo power disconnected, and close any other application using its COM port. Find the port under **Device Manager > Ports (COM & LPT)**.
+
+Choose **Terminal > Run Task > Hexapod: Flash + Serial Console**, then enter the port, for example `COM5`. The task:
+
+1. Builds the current sketch for **ESP32 Dev Module**.
+2. Uploads those freshly built binaries to the COM port you supplied.
+3. Opens an **interactive 115200-baud serial console** in the same focused terminal, only if the upload succeeded.
+
+Type `help` and press **Enter**. Commands and replies use that terminal; this is not a read-only output window. Send `off` and Enter before closing the console with **Ctrl+C**. Closing a monitor alone does not disable a robot already running in radio mode or holding a pose. Close the old monitor before starting another upload.
+
+The tasks in [.vscode/tasks.json](.vscode/tasks.json) launch **Windows PowerShell directly**, even if your default VS Code terminal is WSL. They do not change your default terminal profile. Available tasks:
+
+| Task | Purpose |
+|---|---|
+| **Hexapod: Build** | Build without a connected board; also available through Ctrl+Shift+B |
+| **Hexapod: Flash + Serial Console** | Prompt for COM port, build, upload, then accept serial input |
+| **Hexapod: Serial Console** | Prompt for COM port and reconnect without building/flashing |
+
+Alternatively, in a **Windows PowerShell** terminal opened at the repository root:
+
+```powershell
+.\tools\flash.ps1 -Port COM5
+```
+
+Replace `COM5` with the actual port; omit `-Port` to be prompted. The same script supports:
+
+```powershell
+.\tools\flash.ps1 -BuildOnly
+.\tools\flash.ps1 -MonitorOnly -Port COM5
+```
+
+If local script execution is blocked, use the VS Code tasks or this process-only invocation; no machine-wide execution-policy change is needed:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\flash.ps1 -Port COM5
+```
+
+[tools/flash.ps1](tools/flash.ps1) finds `arduino-cli` on PATH or in the standard Arduino IDE 2.x installation locations. It reuses `%USERPROFILE%\.arduinoIDE\arduino-cli.yaml` when present, including the IDE's existing board packages and libraries. Without that file, the CLI uses its default configuration. Nonstandard installations can pass `-ArduinoCli "C:\path\arduino-cli.exe"` and/or `-ConfigFile "C:\path\arduino-cli.yaml"`.
+
+Build artifacts are cached in [.build/esp32](.build/esp32), which Git ignores. Build or upload failures stop the workflow instead of opening a misleading console or flashing stale artifacts. If only the monitor failed to open, fix the port/connection and use `-MonitorOnly`; a successful upload need not be repeated. The workflow does not request a full-flash erase, so existing NVS settings normally survive uploading.
+
+The terminal monitor is **line-buffered**, allowing normal local typing/editing: press Enter to send a command. In this mode **`!` also needs Enter**; it is not an immediate keystroke emergency stop. Keep the physical power disconnect accessible.
+
+For a standalone Arduino CLI installation on PATH, install the prerequisites once if not already present:
 
 ```powershell
 arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli lib install "Adafruit PWM Servo Driver Library@3.0.3"
-arduino-cli compile --fqbn esp32:esp32:esp32 .
-arduino-cli upload --fqbn esp32:esp32:esp32 --port COM5 .
 ```
 
 If a board does not enter download mode automatically, use its BOOT/EN buttons as directed by its manufacturer. Do not flash the reference MicroPython receiver onto the hexapod's ESP32.
@@ -186,7 +229,7 @@ The gait assumes calibrated physical joint angles. A conservative 1000-2000 us r
 
 Commands are case-insensitive, space/tab separated, and terminated by LF, CR or CRLF. Leg identifiers are `rf rm rr lr lm lf` or `0..5`; joints are `coxa femur tibia` or `0..2`. Numbers must be finite and in range; malformed commands do not partially apply settings. Maximum line length is 159 characters. Overlong/invalid lines are discarded through the next line ending, without stopping the control loop.
 
-`!` disables outputs as soon as that byte is processed, without waiting for Enter. Finish its line before the next command. It is a software disable, not a hardwired emergency stop. `off` also releases torque; `stop` does not.
+`!` disables outputs as soon as that byte reaches the firmware, without waiting for a line ending. Finish its line before the next command. The supplied terminal monitor buffers keyboard input until **Enter**, so `!` still requires Enter there. It is a software disable, not a hardwired emergency stop. `off` also releases torque; `stop` does not.
 
 | Command | Effect |
 |---|---|
@@ -304,5 +347,13 @@ if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-firmware.exe" }
 ```
 
 The integration test suppresses MSVC's double-to-float warnings for the Arduino gait math; the pure logic test uses all warnings as errors. Compilation and host tests cannot verify physical wiring, flash power-loss behavior, supply capacity, actual servo endpoints, RF reception or the gait on your assembled robot. Perform the supported bench checks above before walking.
+
+The flashing-workflow tests use a fake CLI, so no board is needed and nothing is uploaded:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_flash.ps1
+```
+
+[tests/test_flash.ps1](tests/test_flash.ps1) checks build/upload/monitor ordering, use of the same build artifacts, paths containing spaces, COM validation, failure propagation, monitor-only mode and forwarding typed input to the monitor.
 
 Original authors: Ozgur Toprak Onsoy and Emre Kalem. See [LICENSE](LICENSE). The supplied [ESP-NOW examples](espnow/) are retained as transmitter/protocol references; their bulldozer motor and LED logic is not part of the hexapod firmware.

@@ -2,10 +2,6 @@
 // Emre Kalem, 11.2025, Eskisehir, Turkiye
 
 /**
-*   Hexapod source code v1.0.0
-*/
-
-/**
 MIT License
 
 Copyright 2025 Emre Kalem
@@ -20,17 +16,52 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND , EXPRESS OR 
 IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-#include <Servo.h>
-#include  <SPI.h>
-#include "nRF24L01.h"
-#include "RF24.h"
-
-#define _USE_MATH_DEFINES
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <atomic>
 #include <math.h>
+#include "HexapodControl.h"
 
-#define RAD_TO_DEG(x) ((x) * 180.0 / M_PI)
-#define DEG_TO_RAD(x) ((x) * M_PI / 180.0)
 #define POW2(x)       ((x)*(x))
+
+using namespace Hexapod;
+
+constexpr int I2C_SDA = 21;
+constexpr int I2C_SCL = 22;
+constexpr int SERVO_OE = 23;
+constexpr uint8_t DRIVER_ADDRESSES[DRIVER_COUNT] = {0x40, 0x41};
+constexpr uint32_t OSCILLATOR_HZ[DRIVER_COUNT] = {25000000, 25000000};
+constexpr float SERVO_FREQUENCY_HZ = 50.0f;
+constexpr uint32_t UPDATE_INTERVAL_MS = 10;
+constexpr bool CENTER_SERVOS_ONLY = false;
+
+// RF, RM, RR, LR, LM, LF; each row is coxa, femur, tibia.
+const ServoCalibration SERVO_CALIBRATION[LEG_COUNT][JOINT_COUNT] =
+{
+  { {}, {}, {} },
+  { {}, {}, {} },
+  { {}, {}, {} },
+  { {}, {}, {} },
+  { {}, {}, {} },
+  { {}, {}, {} }
+};
+
+Adafruit_PWMServoDriver pwm[DRIVER_COUNT] =
+{
+  Adafruit_PWMServoDriver(DRIVER_ADDRESSES[0]),
+  Adafruit_PWMServoDriver(DRIVER_ADDRESSES[1])
+};
+uint8_t pwmPrescale[DRIVER_COUNT] = {};
+QueueHandle_t controlQueue = nullptr;
+std::atomic<uint32_t> rejectedPackets{0};
+ControlState control;
+uint32_t lastUpdateMs = 0;
 
 struct Vector
 {
@@ -52,24 +83,8 @@ struct Leg
   Vector origin;
   Vector target;
 
-  int servoPins[3];
-  Servo servos[3];
-
-  Leg(int pin0, int pin1, int pin2, float _x, float _y)
-    : servoPins({pin0, pin1, pin2}),
-    origin(_x, _y, 0)
+  Leg(float _x, float _y) : origin(_x, _y, 0)
   {
-  }
-
-  void init()
-  {
-    origin.z = atan2(origin.y, origin.x); // neutral angle
-
-    for (size_t i = 0; i < 3; ++i)
-    {
-      servos[i].attach(servoPins[i]);
-      servos[i].write(90);
-    }
   }
 };
 
@@ -81,106 +96,178 @@ const float STEP_LENGTH = 60.0;
 const float STEP_HEIGHT = 100.0;
 const float DEFAULT_Z = -40.0;
 
-const float WALK_SMOOTHING_FACTOR = 0.4;
-const float STOP_SMOOTHING_FACTOR = 0.4;
-const float ROTATION_STEP_RAD = DEG_TO_RAD(15.0);
+const float SMOOTHING_FACTOR = 0.4;
+const float ROTATION_STEP_RAD = 15.0 * M_PI / 180.0;
 
-Leg legs[6] = 
+Leg legs[LEG_COUNT] =
 {
-  Leg(28, 29, 30, 100.94, -57.11),    // RF
-  Leg(25, 26, 27, 0.0, -105.72),      // RM
-  Leg(22, 23, 24, -100.94, -57.11),   // RR
-  Leg(31,32,33, -100.94, 57.11),      // LR
-  Leg(34,35,36, 0.0, 105.72),         // LM
-  Leg(37,38,39, 100.94, 57.11)        // LF
+  Leg(100.94, -57.11),    // RF
+  Leg(0.0, -105.72),      // RM
+  Leg(-100.94, -57.11),   // RR
+  Leg(-100.94, 57.11),    // LR
+  Leg(0.0, 105.72),       // LM
+  Leg(100.94, 57.11)      // LF
 };
-
-const int CE = 2;
-const int CS = 3;
-int radioData[10] = { 500, 500, 500, 500, 500, 500, 0, 0, 0, 0 };
-RF24 radio(CE, CS);
-const uint64_t pipe = 0xE8E8F0F0E1LL;
 
 float t = 0;
 
-void calculate_fk(const Vector& angles, const Vector& pos, Vector res[4]);
 void calculate_ik(const Leg& leg, Vector& res);
 Vector get_foot_target(float t, size_t legIndex, float direction, float rotation);
 void set_foot_positions(float direction, float rotation);
-void read_radio();
+void read_control();
+
+void halt_with_error(const char* message)
+{
+  digitalWrite(SERVO_OE, HIGH);
+  Serial.printf("ERROR: %s Outputs disabled; fix the fault and reset.\n", message);
+  while (true)
+    delay(1000);
+}
+
+void on_control_received(const esp_now_recv_info_t*, const uint8_t* data, int length)
+{
+  ControlPacket packet;
+  if (length <= 0 || !parseControlPacket(data, size_t(length), packet))
+  {
+    rejectedPackets.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  packet.receivedAtMs = millis();
+  // The Wi-Fi task only publishes data; all I2C work stays in loop().
+  if (xQueueOverwrite(controlQueue, &packet) != pdPASS)
+    rejectedPackets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void init_control()
+{
+  controlQueue = xQueueCreate(1, sizeof(ControlPacket));
+  if (controlQueue == nullptr)
+    halt_with_error("Cannot allocate control queue.");
+  if (!WiFi.mode(WIFI_STA))
+    halt_with_error("Cannot start Wi-Fi station.");
+  if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK ||
+      esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK)
+    halt_with_error("Cannot configure ESP-NOW channel/power saving.");
+  Serial.printf("Receiver STA MAC: %s; ESP-NOW channel: %u\n",
+                WiFi.macAddress().c_str(), ESPNOW_CHANNEL);
+  if (esp_now_init() != ESP_OK ||
+      esp_now_register_recv_cb(on_control_received) != ESP_OK)
+    halt_with_error("Cannot initialize ESP-NOW receiver.");
+}
+
+void write_servo(size_t legIndex, size_t jointIndex, float angle)
+{
+  uint16_t pulseUs = 0;
+  if (!servoPulse(angle, SERVO_CALIBRATION[legIndex][jointIndex], pulseUs))
+    halt_with_error("Invalid servo angle or calibration.");
+  const size_t board = servoBoard(legIndex);
+  const uint8_t channel = servoChannel(legIndex, jointIndex);
+  const uint16_t ticks = pulseToTicks(pulseUs, OSCILLATOR_HZ[board], pwmPrescale[board]);
+  if (ticks == 0 || ticks >= 4096)
+    halt_with_error("Servo pulse outside PCA9685 range.");
+  if (pwm[board].setPWM(channel, 0, ticks) != 0)
+  {
+    Serial.printf("PCA9685 write failed: address 0x%02X, channel %u\n",
+                  DRIVER_ADDRESSES[board], channel);
+    halt_with_error("I2C servo write failed.");
+  }
+}
+
+void init_servos()
+{
+  if (!Wire.begin(I2C_SDA, I2C_SCL))
+    halt_with_error("Cannot initialize I2C.");
+  Wire.setClock(400000);
+  Wire.setTimeOut(20);
+
+  for (size_t board = 0; board < DRIVER_COUNT; ++board)
+  {
+    if (!pwm[board].begin())
+    {
+      Serial.printf("Missing PCA9685 at 0x%02X\n", DRIVER_ADDRESSES[board]);
+      halt_with_error("Check PCA9685 power, wiring and address jumpers.");
+    }
+    pwm[board].setOscillatorFrequency(OSCILLATOR_HZ[board]);
+    pwm[board].setPWMFreq(SERVO_FREQUENCY_HZ);
+    pwmPrescale[board] = pwm[board].readPrescale();
+    const uint8_t expected = uint8_t(lroundf(
+        OSCILLATOR_HZ[board] / (4096.0f * SERVO_FREQUENCY_HZ)) - 1);
+    if (pwmPrescale[board] != expected)
+      halt_with_error("PCA9685 frequency configuration failed.");
+    for (uint8_t channel = 0; channel < 16; ++channel)
+      if (pwm[board].setPWM(channel, 0, 4096) != 0)
+        halt_with_error("Cannot clear PCA9685 outputs.");
+  }
+
+  for (size_t leg = 0; leg < LEG_COUNT; ++leg)
+    for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
+      write_servo(leg, joint, 90.0f);
+  digitalWrite(SERVO_OE, LOW);
+}
 
 void setup()
 {
-  Serial.begin(9600);
+  pinMode(SERVO_OE, OUTPUT);
+  digitalWrite(SERVO_OE, HIGH);
+  Serial.begin(115200);
+  init_control();
+  init_servos();
 
-  radio.begin(); 
-  radio.openReadingPipe(1,pipe);
-  radio.startListening();
-
-  Vector neutralPoints[4] = {};
-  for (size_t i = 0; i < 6; ++i)
+  const float homeReach = COXA_LENGTH + (FEMUR_LENGTH + TIBIA_LENGTH) * cos(M_PI / 4);
+  for (size_t i = 0; i < LEG_COUNT; ++i)
   {
-    legs[i].init();
-
-    const Vector neutralAngles(0, M_PI/4, -M_PI/2);
-    calculate_fk(neutralAngles, legs[i].origin, neutralPoints);
-    
-    legs[i].home = neutralPoints[3];
-    legs[i].home.z = DEFAULT_Z;
-
+    legs[i].origin.z = atan2(legs[i].origin.y, legs[i].origin.x);
+    legs[i].home = Vector(legs[i].origin.x + homeReach * cos(legs[i].origin.z),
+                          legs[i].origin.y + homeReach * sin(legs[i].origin.z),
+                          DEFAULT_Z);
     legs[i].target = legs[i].home;
   }
 
+  Serial.println(CENTER_SERVOS_ONLY ? "Calibration: holding all joints at 90 degrees." :
+                 "Ready: center both sticks to enable walking.");
   delay(1000);
+  lastUpdateMs = millis();
 }
 
 void loop()
 {
-  read_radio();
-  
-  float direction = 0.0;
-  float rotation = 0.0;
-
-  if (radioData[0] < 200)
-    direction = -1.0;
-  else if (radioData[0] > 800)
-    direction = 1.0;
-
-  if (radioData[3] < 200)
-    rotation = 1.0;
-  else if (radioData[3] > 800)
-    rotation = -1.0;
-
-  set_foot_positions(direction, rotation);
-  delay(10);
+  read_control();
+  const uint32_t now = millis();
+  if (uint32_t(now - lastUpdateMs) < UPDATE_INTERVAL_MS)
+  {
+    delay(1);
+    return;
+  }
+  lastUpdateMs = now;
+  if (!CENTER_SERVOS_ONLY)
+    set_foot_positions(control.direction, control.rotation);
 }
 
-void calculate_fk(const Vector& angles, const Vector& pos, Vector res[4])
+void read_control()
 {
-  const float alpha = angles.x + pos.z;
-  const float beta = angles.y;
-  const float gamma = angles.z;
+  const uint32_t now = millis();
+  if (control.expire(now))
+    Serial.println("ESP-NOW timeout: returning home; center sticks to re-arm.");
 
-  const float ca = cos(alpha);
-  const float sa = sin(alpha);
-  const float cb = cos(beta);
-  const float sb = sin(beta);
-  const float cbg = cos(beta + gamma);
-  const float sbg = sin(beta + gamma);
+  ControlPacket packet;
+  if (xQueueReceive(controlQueue, &packet, 0) == pdTRUE)
+  {
+    const bool wasArmed = control.armed;
+    if (!control.receive(packet, millis()))
+      Serial.println("Discarded stale ESP-NOW packet.");
+    else if (!wasArmed && control.armed)
+      Serial.println("ESP-NOW control armed.");
+  }
 
-  res[0] = Vector(pos.x, pos.y, 0);
-  
-  res[1].x = res[0].x + COXA_LENGTH * ca;
-  res[1].y = res[0].y + COXA_LENGTH * sa;
-  res[1].z = res[0].z;
-
-  res[2].x = res[1].x + FEMUR_LENGTH * cb * ca;
-  res[2].y = res[1].y + FEMUR_LENGTH * cb * sa;
-  res[2].z = res[1].z + FEMUR_LENGTH * sb;
-
-  res[3].x = res[1].x + (FEMUR_LENGTH * cb + TIBIA_LENGTH * cbg) * ca;
-  res[3].y = res[1].y + (FEMUR_LENGTH * cb + TIBIA_LENGTH * cbg) * sa;
-  res[3].z = res[1].z + (FEMUR_LENGTH * sb + TIBIA_LENGTH * sbg);
+  static uint32_t lastReportMs = 0;
+  if (uint32_t(now - lastReportMs) >= 1000)
+  {
+    lastReportMs = now;
+    const uint32_t rejected = rejectedPackets.exchange(0, std::memory_order_relaxed);
+    if (rejected != 0)
+      Serial.printf("Rejected %lu ESP-NOW packet(s); expected ten valid CSV fields.\n",
+                    static_cast<unsigned long>(rejected));
+  }
 }
 
 void calculate_ik(const Leg& leg, Vector& res)
@@ -213,13 +300,17 @@ void calculate_ik(const Leg& leg, Vector& res)
     D = fabs(FEMUR_LENGTH - TIBIA_LENGTH) + 0.001;
   }
 
-  res.z = RAD_TO_DEG(acos((POW2(FEMUR_LENGTH) + POW2(TIBIA_LENGTH) - POW2(D)) / (2.0 * FEMUR_LENGTH * TIBIA_LENGTH)) - M_PI);
+  const float kneeCos = constrain((POW2(FEMUR_LENGTH) + POW2(TIBIA_LENGTH) - POW2(D)) /
+                                 (2.0 * FEMUR_LENGTH * TIBIA_LENGTH), -1.0, 1.0);
+  res.z = (acos(kneeCos) - M_PI) * 180.0 / M_PI;
 
   const float beta1 = atan2(relativeTarget.z, l_forward);
-  const float beta2 = acos((POW2(FEMUR_LENGTH) + POW2(D) - POW2(TIBIA_LENGTH)) / (2.0 * FEMUR_LENGTH * D));
-  res.y = RAD_TO_DEG(beta1 + beta2);
+  const float hipCos = constrain((POW2(FEMUR_LENGTH) + POW2(D) - POW2(TIBIA_LENGTH)) /
+                                (2.0 * FEMUR_LENGTH * D), -1.0, 1.0);
+  const float beta2 = acos(hipCos);
+  res.y = (beta1 + beta2) * 180.0 / M_PI;
 
-  res.x = RAD_TO_DEG(atan2(relativeTarget.y, relativeTarget.x));
+  res.x = atan2(relativeTarget.y, relativeTarget.x) * 180.0 / M_PI;
 }
 
 Vector get_foot_target(float t, size_t legIndex, float direction, float rotation)
@@ -269,17 +360,16 @@ Vector get_foot_target(float t, size_t legIndex, float direction, float rotation
 
 void set_foot_positions(float direction, float rotation)
 {
-  t += 0.015;
+  t = fmod(t + 0.015, 1.0);
 
   Vector angles;
-  for (size_t i = 0; i < 6; ++i)
+  for (size_t i = 0; i < LEG_COUNT; ++i)
   {
     const Vector goalTarget = get_foot_target(t, i, direction, rotation);
-    const float smoothingFactor = (direction == 0) ? (STOP_SMOOTHING_FACTOR) : (WALK_SMOOTHING_FACTOR);
 
-    legs[i].target.x += (goalTarget.x - legs[i].target.x) * smoothingFactor;
-    legs[i].target.y += (goalTarget.y - legs[i].target.y) * smoothingFactor;
-    legs[i].target.z += (goalTarget.z - legs[i].target.z) * smoothingFactor;
+    legs[i].target.x += (goalTarget.x - legs[i].target.x) * SMOOTHING_FACTOR;
+    legs[i].target.y += (goalTarget.y - legs[i].target.y) * SMOOTHING_FACTOR;
+    legs[i].target.z += (goalTarget.z - legs[i].target.z) * SMOOTHING_FACTOR;
 
     calculate_ik(legs[i], angles);
 
@@ -289,16 +379,8 @@ void set_foot_positions(float direction, float rotation)
 
     ax = constrain(ax, 45, 135);
 
-    legs[i].servos[0].write(ax);
-    legs[i].servos[1].write(ay);
-    legs[i].servos[2].write(az);
-  }
-}
-
-void read_radio()
-{
-  if (radio.available())
-  {
-    radio.read(radioData, sizeof(radioData));
+    write_servo(i, 0, ax);
+    write_servo(i, 1, ay);
+    write_servo(i, 2, az);
   }
 }

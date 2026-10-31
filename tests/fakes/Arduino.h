@@ -23,6 +23,7 @@ namespace Fake
 inline uint32_t now = 0;
 inline int outputEnable = HIGH;
 inline bool boardsPresent = true, writeFailure = false, radioFailure = false;
+inline int writesUntilFailure = -1;
 inline bool storageFailure = false, readFailure = false;
 inline std::vector<uint8_t> saved;
 inline unsigned saves = 0;
@@ -118,8 +119,10 @@ public:
   uint8_t readPrescale() const { return prescale; }
   int setPWM(uint8_t channel, uint16_t, uint16_t ticks)
   {
-    if (Fake::writeFailure)
+    if (Fake::writeFailure || Fake::writesUntilFailure == 0)
       return 1;
+    if (Fake::writesUntilFailure > 0)
+      --Fake::writesUntilFailure;
     Fake::pwm[board][channel] = ticks;
     return 0;
   }

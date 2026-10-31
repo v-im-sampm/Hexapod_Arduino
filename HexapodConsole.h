@@ -191,7 +191,7 @@ inline bool setParameter(Settings& settings, const char* name, const char* text,
 enum class CommandType
 {
   Help, Status, Show, Params, Save, Load, Defaults, Init, Scan, Off, Stop, Home, Radio,
-  Center, Servo, Pulse, Joints, Foot, Walk, Set, Calibrate, Origin
+  Center, Servo, Pulse, Joints, Foot, Walk, TestServos, Set, Calibrate, Origin
 };
 
 struct Command
@@ -260,7 +260,8 @@ inline bool parseCommand(char* line, Command& command, const char*& error)
     {"save", CommandType::Save}, {"load", CommandType::Load},
     {"defaults", CommandType::Defaults}, {"init", CommandType::Init},
     {"scan", CommandType::Scan}, {"off", CommandType::Off}, {"stop", CommandType::Stop},
-    {"home", CommandType::Home}, {"radio", CommandType::Radio}
+    {"home", CommandType::Home}, {"radio", CommandType::Radio},
+    {"testservos", CommandType::TestServos}
   };
   for (const auto& item : simple)
     if (strcmp(tokens[0], item.name) == 0 && count == 1)

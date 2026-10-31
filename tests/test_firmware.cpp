@@ -110,6 +110,199 @@ void testPersistence()
   send("init");
 }
 
+void checkServoTestOutput(size_t servoIndex, uint16_t pulseUs)
+{
+  CHECK(mode == Mode::ServoTest && Fake::outputEnable == LOW);
+  const size_t leg = servoIndex / JOINT_COUNT;
+  const size_t joint = servoIndex % JOINT_COUNT;
+  CHECK(servoTest.servoIndex == servoIndex);
+  for (size_t i = 0; i < LEG_COUNT; ++i)
+    for (size_t j = 0; j < JOINT_COUNT; ++j)
+      CHECK(lastPulses[i][j] == (i == leg && j == joint ? pulseUs : 0));
+  for (size_t board = 0; board < DRIVER_COUNT; ++board)
+    for (size_t channel = 0; channel < 16; ++channel)
+      CHECK(Fake::pwm[board][channel] ==
+          (board == servoBoard(leg) && channel == servoChannel(leg, joint) ?
+           pulseToTicks(pulseUs, settings.oscillatorHz(board), pwmPrescale[board]) : 4096));
+}
+
+void advanceServoTest()
+{
+  Fake::now = servoTest.startedMs + 1000;
+  loop();
+}
+
+void testServoSequence()
+{
+  send("testservos");
+  const uint32_t started = servoTest.startedMs;
+  const unsigned saves = Fake::saves;
+  send("status");
+  CHECK(Serial.output.find("mode=testservos") != std::string::npos);
+  CHECK(Serial.output.find("rf coxa, address 0x40 channel 0") != std::string::npos);
+  receive("0,2047,0,2047,4095,2047,1,1,1,1");
+  CHECK(!control.armed && control.direction == 0 && control.rotation == 0);
+  const uint16_t pulses[] = {1500, 1472, 1528, 1500};
+  for (size_t servo = 0; servo < 18; ++servo)
+    for (size_t step = 0; step < 4; ++step)
+    {
+      CHECK(servoTest.step == step);
+      checkServoTestOutput(servo, pulses[step]);
+      Fake::now = servoTest.startedMs + 999;
+      loop();
+      CHECK(servoTest.step == step);
+      checkServoTestOutput(servo, pulses[step]);
+      loop();
+    }
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !control.armed);
+  CHECK(uint32_t(Fake::now - started) == 72001);
+  CHECK(Fake::saves == saves);
+  CHECK(Serial.output.find("lf tibia, address 0x41 channel 8") != std::string::npos);
+  CHECK(Serial.output.find("Servo test complete; outputs disabled") != std::string::npos);
+  for (auto& board : Fake::pwm)
+    for (uint16_t ticks : board)
+      CHECK(ticks == 4096);
+  for (auto& leg : lastPulses)
+    for (uint16_t pulse : leg)
+      CHECK(pulse == 0);
+  receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+}
+
+void testServoTestControls()
+{
+  send("servo lf tibia 90");
+  send("testservos");
+  CHECK(mode == Mode::Pose && lastPulses[5][2] == 1500);
+  CHECK(Serial.output.find("off first") != std::string::npos);
+  send("off");
+  send("testservos extra");
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  send("testservos");
+  checkServoTestOutput(0, 1500);
+  const char* blocked[] = {"testservos", "servo lf tibia 90", "save", "init", "set step_length 30"};
+  for (const char* command : blocked)
+  {
+    send(command);
+    CHECK(Serial.output.find("off first") != std::string::npos);
+    checkServoTestOutput(0, 1500);
+  }
+  for (char character : std::string("servo rf"))
+    Serial.input.push_back(character);
+  advanceServoTest();
+  checkServoTestOutput(0, 1472);
+  send("");
+  CHECK(Serial.output.find("ERROR") != std::string::npos);
+  checkServoTestOutput(0, 1472);
+  send("stop");
+  CHECK(mode == Mode::Pose && Fake::outputEnable == LOW);
+  CHECK(lastPulses[0][0] == 1472);
+  Fake::now += 5000;
+  loop();
+  CHECK(mode == Mode::Pose && lastPulses[0][0] == 1472);
+  send("off");
+
+  for (const char* command : {"off", "!"})
+  {
+    send("testservos");
+    advanceServoTest();
+    send(command);
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+    Fake::now += 5000;
+    loop();
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  }
+
+  const struct { const char* command; Mode expected; } handovers[] =
+  {
+    {"home", Mode::Home}, {"radio", Mode::Radio}, {"walk 0.25 0 100", Mode::Walk}
+  };
+  for (const auto& handover : handovers)
+  {
+    send("testservos");
+    send(handover.command);
+    CHECK(mode == handover.expected && Fake::outputEnable == LOW && !control.armed);
+    for (auto& leg : lastPulses)
+      for (uint16_t pulse : leg)
+        CHECK(pulse > 0);
+    send("testservos");
+    CHECK(mode == handover.expected && Serial.output.find("off first") != std::string::npos);
+    Fake::now += 5000;
+    loop();
+    CHECK(mode != Mode::ServoTest);
+    send("off");
+  }
+}
+
+void testServoTestTimingAndFaults()
+{
+  send("cal rf coxa 900 2100 5 1");
+  send("testservos");
+  checkServoTestOutput(0, 1533);
+  advanceServoTest();
+  checkServoTestOutput(0, 1567);
+  advanceServoTest();
+  checkServoTestOutput(0, 1500);
+  advanceServoTest();
+  checkServoTestOutput(0, 1533);
+  send("off");
+  send("defaults");
+
+  Fake::now = UINT32_MAX - 500;
+  send("testservos");
+  Fake::now = servoTest.startedMs + 999;
+  loop();
+  checkServoTestOutput(0, 1500);
+  loop();
+  checkServoTestOutput(0, 1472);
+  CHECK(servoTest.startedMs < 1000);
+  Fake::now = servoTest.startedMs + 15000;
+  loop();
+  CHECK(servoTest.step == 2);
+  checkServoTestOutput(0, 1528);
+  loop();
+  checkServoTestOutput(0, 1528);
+  send("off");
+
+  for (int writes : {0, 32})
+  {
+    Fake::writesUntilFailure = writes;
+    send("testservos");
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+    CHECK(Serial.output.find("ERROR") != std::string::npos);
+    Fake::writesUntilFailure = -1;
+    send("testservos");
+    CHECK(mode == Mode::Off && Serial.output.find("init") != std::string::npos);
+    send("init");
+    CHECK(servosReady && mode == Mode::Off && Fake::outputEnable == HIGH);
+  }
+
+  for (int step : {0, 3})
+  {
+    send("testservos");
+    for (int i = 0; i < step; ++i)
+      advanceServoTest();
+    Fake::writeFailure = true;
+    advanceServoTest();
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+    CHECK(Serial.output.find("ERROR") != std::string::npos);
+    Fake::writeFailure = false;
+    send("init");
+    CHECK(servosReady && mode == Mode::Off && Fake::outputEnable == HIGH);
+  }
+
+  send("testservos");
+  for (int step = 0; step < 3; ++step)
+    advanceServoTest();
+  Fake::writesUntilFailure = 1;
+  advanceServoTest();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+  CHECK(Fake::pwm[0][0] == 4096 && Fake::pwm[0][1] == 4096);
+  CHECK(Serial.output.find("ERROR") != std::string::npos);
+  Fake::writesUntilFailure = -1;
+  send("init");
+}
+
 void testMotionAndRecovery()
 {
   send("walk 1 0 10001");
@@ -166,7 +359,10 @@ void testMotionAndRecovery()
 int main()
 {
   testBootAndPoses();
+  testServoSequence();
+  testServoTestControls();
+  testServoTestTimingAndFaults();
   testPersistence();
   testMotionAndRecovery();
-  puts("PASS: actual firmware console, disabled boot, poses, NVS failures/reboot, timed motion and fault recovery.");
+  puts("PASS: actual firmware console, disabled boot, poses, sequential servo tests, NVS failures/reboot, timed motion and fault recovery.");
 }

@@ -41,7 +41,17 @@ Settings settings;
 Preferences preferences;
 ConsoleLine consoleLine;
 TimedMotion manualMotion;
-enum class Mode { Off, Pose, Home, Radio, Walk };
+constexpr uint32_t SERVO_TEST_STEP_MS = 1000;
+constexpr float SERVO_TEST_ANGLES[] = {90.0f, 85.0f, 95.0f, 90.0f};
+constexpr size_t SERVO_TEST_STEP_COUNT = sizeof(SERVO_TEST_ANGLES) / sizeof(SERVO_TEST_ANGLES[0]);
+struct ServoTestState
+{
+  size_t servoIndex = 0;
+  size_t step = 0;
+  uint32_t startedMs = 0;
+};
+ServoTestState servoTest;
+enum class Mode { Off, Pose, Home, Radio, Walk, ServoTest };
 Mode mode = Mode::Off;
 bool servosReady = false;
 bool radioReady = false;
@@ -100,6 +110,7 @@ void disable_outputs()
   digitalWrite(SERVO_OE, HIGH);
   mode = Mode::Off;
   control = ControlState{};
+  servoTest = ServoTestState{};
   memset(lastPulses, 0, sizeof(lastPulses));
 }
 
@@ -348,6 +359,64 @@ void enable_pose()
   Serial.println("Pose applied; ESP-NOW ignored. Other previously tested joints keep holding.");
 }
 
+void print_servo_test_step()
+{
+  const size_t leg = servoTest.servoIndex / JOINT_COUNT;
+  const size_t joint = servoTest.servoIndex % JOINT_COUNT;
+  Serial.printf("Servo test %u/%u: %s %s, address 0x%02X channel %u, nominal %.0f deg (%u us).\n",
+      unsigned(servoTest.servoIndex + 1), unsigned(LEG_COUNT * JOINT_COUNT),
+      LEG_NAMES[leg], JOINT_NAMES[joint], DRIVER_ADDRESSES[servoBoard(leg)],
+      servoChannel(leg, joint), SERVO_TEST_ANGLES[servoTest.step], lastPulses[leg][joint]);
+}
+
+void start_servo_test()
+{
+  if (!require_off() || !prepare_pose())
+    return;
+  servoTest = ServoTestState{};
+  if (!write_servo(0, 0, SERVO_TEST_ANGLES[0]))
+    return;
+  mode = Mode::ServoTest;
+  digitalWrite(SERVO_OE, LOW);
+  servoTest.startedMs = millis();
+  Serial.println("Servo test started: one joint at a time, 90/85/95/90 deg, 1000 ms each."
+                 " Support the robot; stop holds the current joint, !/off disables outputs.");
+  print_servo_test_step();
+}
+
+void update_servo_test(uint32_t now)
+{
+  if (mode != Mode::ServoTest || uint32_t(now - servoTest.startedMs) < SERVO_TEST_STEP_MS)
+    return;
+  size_t leg = servoTest.servoIndex / JOINT_COUNT;
+  size_t joint = servoTest.servoIndex % JOINT_COUNT;
+  if (++servoTest.step == SERVO_TEST_STEP_COUNT)
+  {
+    digitalWrite(SERVO_OE, HIGH);
+    if (pwm[servoBoard(leg)].setPWM(servoChannel(leg, joint), 0, 4096) != 0)
+    {
+      servo_error("Cannot disable tested servo.");
+      return;
+    }
+    lastPulses[leg][joint] = 0;
+    if (++servoTest.servoIndex == LEG_COUNT * JOINT_COUNT)
+    {
+      disable_outputs();
+      Serial.println("Servo test complete; outputs disabled. Radio remains ignored.");
+      return;
+    }
+    servoTest.step = 0;
+    leg = servoTest.servoIndex / JOINT_COUNT;
+    joint = servoTest.servoIndex % JOINT_COUNT;
+  }
+  if (!write_servo(leg, joint, SERVO_TEST_ANGLES[servoTest.step]))
+    return;
+  digitalWrite(SERVO_OE, LOW);
+  // Start a fresh hold after each write; delayed loops must not skip angles.
+  servoTest.startedMs = millis();
+  print_servo_test_step();
+}
+
 bool enter_home()
 {
   if (!servosReady)
@@ -355,7 +424,7 @@ bool enter_home()
     Serial.println("ERROR: servo drivers not ready; use init.");
     return false;
   }
-  if (mode == Mode::Off || mode == Mode::Pose)
+  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest)
   {
     digitalWrite(SERVO_OE, HIGH);
     rebuild_geometry();
@@ -370,7 +439,7 @@ bool enter_home()
 
 void print_status()
 {
-  const char* names[] = {"off", "pose", "home", "radio", "walk"};
+  const char* names[] = {"off", "pose", "home", "radio", "walk", "testservos"};
   Serial.printf("mode=%s OE=%s drivers=%s radio=%s unsaved=%s MAC=%s\n",
       names[size_t(mode)], mode == Mode::Off ? "HIGH" : "LOW",
       servosReady ? "ready" : "init-needed", radioReady ? "ready" : "init-needed",
@@ -386,7 +455,9 @@ void print_status()
   }
   else
     Serial.println("No valid RX packet since initialization.");
-  if (mode == Mode::Off || mode == Mode::Pose)
+  if (mode == Mode::ServoTest)
+    print_servo_test_step();
+  if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest)
     for (size_t leg = 0; leg < LEG_COUNT; ++leg)
       Serial.printf("%s commanded us (0=off): %u %u %u\n", LEG_NAMES[leg],
                     lastPulses[leg][0], lastPulses[leg][1], lastPulses[leg][2]);
@@ -399,6 +470,7 @@ void print_help()
       "  help | status | params | show\n"
       "  off | ! (immediate disable; finish with newline) | stop (return home if walking)\n"
       "  center [all|LEG] | servo LEG JOINT ANGLE | pulse LEG JOINT US\n"
+      "  testservos (while off; one joint at a time, 90/85/95/90 deg, 1000 ms each)\n"
       "  joints LEG COXA FEMUR TIBIA | foot LEG DX DY DZ (offset mm from home)\n"
       "  home | radio | walk DIRECTION ROTATION DURATION_MS (100..10000)\n"
       "  set NAME VALUE | cal LEG JOINT MIN_US MAX_US TRIM REVERSE\n"
@@ -406,6 +478,7 @@ void print_help()
       "LEG=rf/rm/rr/lr/lm/lf or 0..5; JOINT=coxa/femur/tibia or 0..2.\n"
       "Use off before configuration, storage, scan, init, help, params or show.\n"
       "Direct joint tests require off/pose. walk/home/radio explicitly take control.\n"
+      "stop cancels testservos holding the current joint; completion disables outputs.\n"
       "Only save writes settings. Boot always stays off; !/off releases torque.");
 }
 
@@ -458,8 +531,18 @@ void execute_command(const Command& command)
   {
     if (mode == Mode::Radio || mode == Mode::Walk)
       mode = Mode::Home;
+    else if (mode == Mode::ServoTest)
+    {
+      mode = Mode::Pose;
+      servoTest = ServoTestState{};
+    }
     control = ControlState{};
     Serial.println("Motion stopped; current pose/home held unless outputs were already off.");
+    return;
+  }
+  if (command.type == CommandType::TestServos)
+  {
+    start_servo_test();
     return;
   }
   if (command.type == CommandType::Home || command.type == CommandType::Radio ||
@@ -694,6 +777,7 @@ void loop()
   }
   read_console();
   const uint32_t now = millis();
+  update_servo_test(now);
   if (uint32_t(now - lastUpdateMs) >= settings.updateMs)
   {
     lastUpdateMs = now;

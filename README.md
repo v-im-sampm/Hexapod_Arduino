@@ -225,6 +225,21 @@ MG996R travel and pulse limits vary, especially among clones. Do **not** assume 
 
 The gait assumes calibrated physical joint angles. A conservative 1000-2000 us range may produce less travel and is **not** a verified full-range calibration for your MG996Rs. If a servo cannot cover the required travel, adjust the mechanism/gait rather than forcing it against its stops. Nominal angles are clamped to 0-180 after reversal/trim. Gait coxa limits default to 45-135 degrees; direct `servo`/`joints` tests intentionally permit 0-180 for calibration.
 
+### Automated one-servo-at-a-time test
+
+After manually checking each joint's neutral position and clearance, support the robot with its feet clear and keep the physical servo-power disconnect within reach. Send these commands individually:
+
+```text
+off
+testservos
+```
+
+`testservos` requires off mode and initialized drivers. It tests all eighteen joints in wiring order: **rf, rm, rr, lr, lm, lf**, with **coxa, femur, tibia** for each leg. Only the current joint receives pulses; previously tested joints and unused channels are disabled. Each joint moves through nominal **90 -> 85 -> 95 -> 90 degrees**, holding each angle for **1000 ms** before advancing. The existing pulse limits, trim and reversal apply. This is a small-range check, not an endpoint sweep or automatic calibration; even these angles must be checked for mechanical clearance first.
+
+The console reports each joint, board address, channel, nominal angle and commanded pulse width. `status` remains available. The non-blocking sequence normally takes about **72 seconds**; delayed loop servicing extends holds rather than skipping movements. These are commanded positions, not measured feedback, and completion does not certify that a servo moved correctly.
+
+Send `off` or `!` to cancel and disable outputs, or `stop` to cancel while retaining the current joint's holding torque. **Normal completion disables all outputs and releases torque**, so keep the body supported throughout. Radio packets never interrupt or resume the sequence; `home`, `walk` or `radio` explicitly cancel it and enable all legs, which can move joints abruptly. Direct pose commands and configuration require leaving the sequence first. An I2C fault disables outputs and requires `init` before restarting. The sequence does not change or save settings.
+
 ## 7. Serial console reference
 
 Commands are case-insensitive, space/tab separated, and terminated by LF, CR or CRLF. Leg identifiers are `rf rm rr lr lm lf` or `0..5`; joints are `coxa femur tibia` or `0..2`. Numbers must be finite and in range; malformed commands do not partially apply settings. Maximum line length is 159 characters. Overlong/invalid lines are discarded through the next line ending, without stopping the control loop.
@@ -234,7 +249,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | Command | Effect |
 |---|---|
 | `help` | Command summary (while off) |
-| `status` | Mode, OE, driver/radio readiness, unsaved changes, MAC, latest RX values/age; while off/posing, commanded servo pulses (not position feedback) |
+| `status` | Mode, OE, driver/radio readiness, unsaved changes, MAC, latest RX values/age; while off/posing/testing servos, commanded pulses and current sequence step (not position feedback) |
 | `params` | All named parameter ranges (while off) |
 | `show` | All current parameters, leg origins and eighteen calibrations, displayed as commands (while off) |
 | `off` / `!` | Disable both PCA9685 outputs immediately; radio cannot re-enable them |
@@ -242,6 +257,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `center [all\|LEG]` | Hold nominal 90 degrees; default is all joints |
 | `servo LEG JOINT ANGLE` | Test one nominal angle, 0-180 degrees |
 | `pulse LEG JOINT US` | Test an integer pulse width within that servo's calibrated limits |
+| `testservos` | While off, test all eighteen joints one-by-one at nominal 90/85/95/90 degrees, 1000 ms per angle; disable outputs on completion; `stop` cancels holding the current joint |
 | `joints LEG COXA FEMUR TIBIA` | Set all three nominal angles of one leg |
 | `foot LEG DX DY DZ` | Test one foot via IK; offsets from that leg's home in body coordinates, each -150..150 mm; unreachable targets/joint angles are rejected |
 | `home` | Enable all legs at the home stance; ignore radio |
@@ -256,7 +272,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `init` | Reinitialize radio/drivers with current settings, clear PWM registers, leave outputs off |
 | `scan` | Scan the I2C bus while off; normally 0x40/0x41 and possibly 0x70 |
 
-Direct servo/foot tests require **off or pose** mode; send `off` first if home/radio/walking. The first pose command after off clears stale PWM outputs so unrelated joints do not unexpectedly re-enable. `home`, `walk` and `radio` explicitly select their control source and enable all legs; moving from a direct pose to home can move joints abruptly. Support the robot. Neither completion of a serial test nor a reconnect automatically resumes radio control.
+Direct servo/foot tests require **off or pose** mode; send `off` first if home/radio/walking, or cancel `testservos` with `off`/`stop`. The first pose command after off clears stale PWM outputs so unrelated joints do not unexpectedly re-enable. `home`, `walk` and `radio` explicitly select their control source and enable all legs; moving from a direct pose to home can move joints abruptly. Support the robot. Neither completion of a serial test nor a reconnect automatically resumes radio control.
 
 Long diagnostics/configuration/flash operations require off so they cannot block an active gait. Input processing is bounded and non-blocking; partial lines do not pause the gait, radio watchdog or test deadline. Durations and radio timeouts are serviced by the main loop, not hard-real-time timers.
 
@@ -335,7 +351,7 @@ Valid settings load automatically on boot, **but output enable state, pose, armi
 
 ## Validation
 
-The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, saved-setting reboot/load/write failures, control-source transitions, the 10-second walking limit and recovery after I2C faults.
+The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, the complete one-servo-at-a-time sequence (angle order, 1000 ms holds, calibration, cancellation, radio isolation, control handovers, timer wraparound and I2C failures), saved-setting reboot/load/write failures, control-source transitions, the 10-second walking limit and recovery after I2C faults.
 
 Run the tests from a Visual Studio Developer PowerShell with MSVC installed:
 

@@ -58,7 +58,7 @@ OE is active-low: GPIO23 LOW enables pulses; HIGH disables both boards. Add an *
          |     +---[1 kOhm]--- ESP32 3V3
          |
          |               V+ NOT CONNECTED           V+ NOT CONNECTED
-         |               S0-S8 --> right legs       S0-S8 --> left legs
+         |               S0-S8 --> right legs       S7-S15 --> left legs
          |
          +--------------------------- COMMON GROUND
                                       |
@@ -106,11 +106,11 @@ Channel numbers are the **printed, zero-based PCA9685 channel labels**, not ESP3
 | Right front (RF) | 0 | #1 / 0x40 | 0 | 1 | 2 |
 | Right middle (RM) | 1 | #1 / 0x40 | 3 | 4 | 5 |
 | Right rear (RR) | 2 | #1 / 0x40 | 6 | 7 | 8 |
-| Left rear (LR) | 3 | #2 / 0x41 | 0 | 1 | 2 |
-| Left middle (LM) | 4 | #2 / 0x41 | 3 | 4 | 5 |
-| Left front (LF) | 5 | #2 / 0x41 | 6 | 7 | 8 |
+| Left rear (LR) | 3 | #2 / 0x41 | 7 | 8 | 9 |
+| Left middle (LM) | 4 | #2 / 0x41 | 10 | 11 | 12 |
+| Left front (LF) | 5 | #2 / 0x41 | 13 | 14 | 15 |
 
-Channels **9-15 on both boards are unused and disabled**. Every servo's red and brown/black wires connect to the external power harness described above, regardless of its signal channel.
+Channels **9-15 on board #1 (0x40)** and **0-6 on board #2 (0x41)** are unused and disabled. Every servo's red and brown/black wires connect to the external power harness described above, regardless of its signal channel.
 
 ## 4. Build and upload
 
@@ -344,7 +344,7 @@ Valid settings load automatically on boot, **but output enable state, pose, armi
 
 - **Missing PCA9685 / disabled outputs:** check VCC=3.3 V, shared ground, SDA/SCL, and A0 on board #2. Both drivers are required. Fix the fault and use `init`. `scan` may also show the PCA9685 all-call address 0x70; that is not a third board.
 - **No servo movement:** boot is intentionally off. Check `status`, external servo power and grounds, and the correct S/PWM pins; use a deliberate `servo`, `center`, `home` or `radio` command after calibration.
-- **Wrong leg/joint moves:** use the robot-perspective channel table; board #2 starts with the **left rear**, not left front.
+- **Wrong leg/joint moves:** use the robot-perspective channel table; board #2 starts at **channel 7 with the left rear**, not left front.
 - **No remote control:** select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Radio packets are deliberately ignored for motion in all other modes.
 - **Resets/jitter:** check servo current demand, power/ground routing, bulk capacitance, and short I2C wiring. Never join a 5 V pull-up to an ESP32 GPIO.
 - **I2C error during motion:** both OEs are driven high; motion stops but the console remains available. Loss of pulses may release servo torque, so the robot can collapse. Fix the fault, then `init`; output remains off until explicitly enabled. A software failsafe or OE is not a substitute for supporting the robot and a physical power disconnect.

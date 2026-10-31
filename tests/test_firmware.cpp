@@ -48,12 +48,15 @@ void testBootAndPoses()
   send("save");
   CHECK(Fake::saves == 0);
   send("off");
+  send("servo lr coxa 90");
+  CHECK(Fake::pwm[1][7] == 307 && Fake::pwm[1][0] == 4096 && Fake::pwm[0][0] == 4096);
+  send("off");
   send("servo lf tibia 90");
-  CHECK(Fake::pwm[1][8] == 307 && Fake::pwm[0][0] == 4096);
+  CHECK(Fake::pwm[1][15] == 307 && Fake::pwm[1][7] == 4096 && Fake::pwm[0][0] == 4096);
   send("center all");
-  for (auto& board : Fake::pwm)
+  for (size_t board = 0; board < DRIVER_COUNT; ++board)
     for (size_t channel = 0; channel < 16; ++channel)
-      CHECK(board[channel] == (channel < 9 ? 307 : 4096));
+      CHECK(Fake::pwm[board][channel] == ((board == 0 ? channel < 9 : channel >= 7) ? 307 : 4096));
   send("off");
   send("foot rf 0 0 0");
   CHECK(mode == Mode::Pose && lastPulses[0][0] == 1500 && lastPulses[0][2] > 0);
@@ -157,7 +160,7 @@ void testServoSequence()
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !control.armed);
   CHECK(uint32_t(Fake::now - started) == 72001);
   CHECK(Fake::saves == saves);
-  CHECK(Serial.output.find("lf tibia, address 0x41 channel 8") != std::string::npos);
+  CHECK(Serial.output.find("lf tibia, address 0x41 channel 15") != std::string::npos);
   CHECK(Serial.output.find("Servo test complete; outputs disabled") != std::string::npos);
   for (auto& board : Fake::pwm)
     for (uint16_t ticks : board)

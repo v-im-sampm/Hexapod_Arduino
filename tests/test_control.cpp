@@ -347,6 +347,16 @@ void testConsole()
     else
       CHECK(event == LineEvent::None);
   }
+  CHECK(line.push('\n') == LineEvent::Empty);
+  CHECK(line.push('\n') == LineEvent::Empty);
+  CHECK(line.push('\r') == LineEvent::Empty);
+  CHECK(line.push('\r') == LineEvent::Empty);
+  CHECK(line.push('\n') == LineEvent::None);
+  CHECK(line.push('\r') == LineEvent::Empty);
+  CHECK(line.push('x') == LineEvent::None);
+  CHECK(line.push('\b') == LineEvent::None);
+  CHECK(line.push('\n') == LineEvent::Empty);
+  CHECK(line.data[0] == '\0');
   for (size_t i = 0; i < sizeof(line.data) - 1; ++i)
     CHECK(line.push('a') == LineEvent::None);
   CHECK(line.push('a') == LineEvent::Overflow);
@@ -361,6 +371,24 @@ void testConsole()
   CHECK(line.push('\b') == LineEvent::None);
   CHECK(line.push('h') == LineEvent::None);
   CHECK(line.push('\n') == LineEvent::Ready && strcmp(line.data, "h") == 0);
+
+  for (const char* ending : {"\n", "\r", "\r\n"})
+  {
+    for (char invalidCharacter : {'!', '\0'})
+    {
+      ConsoleLine discarded;
+      CHECK(discarded.push(invalidCharacter) ==
+          (invalidCharacter == '!' ? LineEvent::Disable : LineEvent::Invalid));
+      for (char character : std::string(ending))
+        CHECK(discarded.push(character) == LineEvent::None);
+    }
+    ConsoleLine overlong;
+    for (size_t i = 0; i < sizeof(overlong.data) - 1; ++i)
+      CHECK(overlong.push('a') == LineEvent::None);
+    CHECK(overlong.push('a') == LineEvent::Overflow);
+    for (char character : std::string(ending))
+      CHECK(overlong.push(character) == LineEvent::None);
+  }
 
   TimedMotion motion{1, -1, UINT32_MAX - 10, 10000};
   CHECK(!motion.expired(uint32_t(motion.startedMs + 9999)));

@@ -372,7 +372,7 @@ void print_servo_test_step()
 void print_servo_test_pause()
 {
   const size_t leg = servoTest.servoIndex / JOINT_COUNT;
-  Serial.printf("Leg %s test complete; outputs disabled. Paused: retest repeats this leg; next %s.\n",
+  Serial.printf("Leg %s test complete; outputs disabled. Paused: retest repeats this leg; next or Enter %s.\n",
       LEG_NAMES[leg], leg + 1 < LEG_COUNT ? "tests the next leg" : "finishes the sequence");
 }
 
@@ -397,7 +397,7 @@ void start_servo_test()
   if (!apply_servo_test_step())
     return;
   Serial.println("Servo test started: one joint at a time, 90/85/95/90 deg, 1000 ms each."
-                 " Pauses after each leg: retest repeats it, next advances."
+                 " Pauses after each leg: retest repeats it, next or Enter advances."
                  " Support the robot; stop holds the current joint, !/off disables outputs.");
   print_servo_test_step();
 }
@@ -510,7 +510,7 @@ void print_help()
       "  off | ! (immediate disable; finish with newline) | stop (return home if walking)\n"
       "  center [all|LEG] | servo LEG JOINT ANGLE | pulse LEG JOINT US\n"
       "  testservos (while off; one joint at a time, 90/85/95/90 deg, 1000 ms each)\n"
-      "  next | retest (only at the pause after each leg; outputs disabled while paused)\n"
+      "  next (or Enter on an empty line) | retest (only at the pause after each leg; outputs disabled while paused)\n"
       "  joints LEG COXA FEMUR TIBIA | foot LEG DX DY DZ (offset mm from home)\n"
       "  home | radio | walk DIRECTION ROTATION DURATION_MS (100..10000)\n"
       "  set NAME VALUE | cal LEG JOINT MIN_US MAX_US TRIM REVERSE\n"
@@ -518,7 +518,7 @@ void print_help()
       "LEG=rf/rm/rr/lr/lm/lf or 0..5; JOINT=coxa/femur/tibia or 0..2.\n"
       "Use off before configuration, storage, scan, init, help, params or show.\n"
       "Direct joint tests require off/pose. walk/home/radio explicitly take control.\n"
-      "next advances/finishes testservos; retest repeats the paused leg.\n"
+      "next or Enter advances/finishes testservos; retest repeats the paused leg.\n"
       "stop cancels testservos holding the active joint or staying off if paused.\n"
       "Only save writes settings. Boot always stays off; !/off releases torque.");
 }
@@ -789,6 +789,12 @@ void read_console()
     if (event == LineEvent::Overflow || event == LineEvent::Invalid)
     {
       Serial.println("ERROR: invalid/overlong line discarded; finish with newline.");
+      return;
+    }
+    if (event == LineEvent::Empty)
+    {
+      if (mode == Mode::ServoTestPaused)
+        resume_servo_test(false);
       return;
     }
     if (event == LineEvent::Ready)

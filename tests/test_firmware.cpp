@@ -11,10 +11,10 @@ void check(bool condition, const char* expression, int line)
 }
 #define CHECK(condition) check((condition), #condition, __LINE__)
 
-void send(const std::string& text)
+void send(const std::string& text, const std::string& ending = "\n")
 {
   Serial.output.clear();
-  for (char character : text + "\n")
+  for (char character : text + ending)
     Serial.input.push_back(character);
   while (!Serial.input.empty())
     loop();
@@ -191,7 +191,7 @@ void testServoSequence()
       if (leg + 1 == LEG_COUNT)
       {
         CHECK(Serial.output.find("lf tibia, address 0x41 channel 8") != std::string::npos);
-        CHECK(Serial.output.find("next finishes the sequence") != std::string::npos);
+        CHECK(Serial.output.find("next or Enter finishes the sequence") != std::string::npos);
       }
       Fake::now += 5000;
       loop();
@@ -215,6 +215,53 @@ void testServoSequence()
       CHECK(pulse == 0);
   receive("0,2047,2047,2047,2047,2047,1,1,1,1");
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+}
+
+void testServoEnterToAdvance()
+{
+  for (const char* ending : {"\n", "\r", "\r\n"})
+  {
+    send("", ending);
+    CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && Serial.output.empty());
+    send("testservos", ending);
+    for (size_t leg = 0; leg < LEG_COUNT; ++leg)
+    {
+      send("", ending);
+      checkServoTestOutput(leg * JOINT_COUNT, 1500);
+      CHECK(servoTest.step == 0 && Serial.output.empty());
+      runServoTestLeg(leg);
+      send("status", ending);
+      checkServoTestPaused(leg);
+      CHECK(Serial.output.find("ERROR") == std::string::npos);
+      if (leg == 0)
+      {
+        const std::string invalid[] = {" ", std::string(160, 'a'), std::string(1, '\0')};
+        for (const std::string& text : invalid)
+        {
+          send(text, ending);
+          checkServoTestPaused(leg);
+          CHECK(Serial.output.find("ERROR") != std::string::npos);
+        }
+        send("status", "\r");
+        checkServoTestPaused(leg);
+        send("");
+        checkServoTestPaused(leg);
+        CHECK(Serial.output.empty());
+      }
+      send("", ending);
+      CHECK(Serial.output.find("ERROR") == std::string::npos);
+      if (leg + 1 < LEG_COUNT)
+      {
+        checkServoTestOutput((leg + 1) * JOINT_COUNT, 1500);
+        CHECK(servoTest.step == 0);
+      }
+      else
+      {
+        CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !control.armed);
+        CHECK(Serial.output.find("Servo test complete; outputs disabled") != std::string::npos);
+      }
+    }
+  }
 }
 
 void testServoTestControls()
@@ -508,6 +555,7 @@ int main()
 {
   testBootAndPoses();
   testServoSequence();
+  testServoEnterToAdvance();
   testServoTestControls();
   testServoPausedControls();
   testServoTestTimingAndFaults();

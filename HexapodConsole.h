@@ -352,16 +352,23 @@ inline bool parseCommand(char* line, Command& command, const char*& error)
   return true;
 }
 
-enum class LineEvent { None, Ready, Overflow, Invalid, Disable };
+enum class LineEvent { None, Ready, Empty, Overflow, Invalid, Disable };
 
 struct ConsoleLine
 {
   char data[160] = {};
   size_t length = 0;
   bool discarding = false;
+  bool skipNextLf = false;
 
   LineEvent push(char character)
   {
+    if (character == '\n' && skipNextLf)
+    {
+      skipNextLf = false;
+      return LineEvent::None;
+    }
+    skipNextLf = character == '\r';
     if (character == '!')
     {
       length = 0;
@@ -371,10 +378,11 @@ struct ConsoleLine
     if (character == '\r' || character == '\n')
     {
       data[length] = '\0';
-      const bool ready = length != 0 && !discarding;
+      const LineEvent event = discarding ? LineEvent::None :
+          (length != 0 ? LineEvent::Ready : LineEvent::Empty);
       length = 0;
       discarding = false;
-      return ready ? LineEvent::Ready : LineEvent::None;
+      return event;
     }
     if (discarding)
       return LineEvent::None;

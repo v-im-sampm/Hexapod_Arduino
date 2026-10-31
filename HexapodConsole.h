@@ -190,7 +190,7 @@ inline bool setParameter(Settings& settings, const char* name, const char* text,
 
 enum class CommandType
 {
-  Help, Status, Show, Params, Save, Load, Defaults, Init, Scan, Off, Stop, Home, Radio,
+  Help, Status, Show, Params, Save, Load, Defaults, Init, Scan, Off, Stop, Home, Radio, Web,
   Center, Servo, Pulse, Joints, Foot, Walk, TestServos, Next, Retest, Set, Calibrate, Origin
 };
 
@@ -260,7 +260,7 @@ inline bool parseCommand(char* line, Command& command, const char*& error)
     {"save", CommandType::Save}, {"load", CommandType::Load},
     {"defaults", CommandType::Defaults}, {"init", CommandType::Init},
     {"scan", CommandType::Scan}, {"off", CommandType::Off}, {"stop", CommandType::Stop},
-    {"home", CommandType::Home}, {"radio", CommandType::Radio},
+    {"home", CommandType::Home}, {"radio", CommandType::Radio}, {"web", CommandType::Web},
     {"testservos", CommandType::TestServos}, {"next", CommandType::Next},
     {"retest", CommandType::Retest}
   };

@@ -31,6 +31,8 @@ void testBootAndPoses()
   setup();
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
   CHECK(servosReady && radioReady && Fake::saves == 0);
+  CHECK(apActive && Fake::apStarted && Fake::wifiMode == WIFI_AP_STA);
+  CHECK(Fake::apName == "Hexapod-334455" && Fake::channel == settings.radioChannel);
   for (auto& board : Fake::pwm)
     for (uint16_t ticks : board)
       CHECK(ticks == 4096);
@@ -551,6 +553,254 @@ void testMotionAndRecovery()
   CHECK(servosReady && mode == Mode::Off && Fake::outputEnable == HIGH);
 }
 
+httpd_req_t http(const char* path, const std::string& body = "", bool authorized = true,
+                bool serviceMainLoop = true)
+{
+  httpd_req_t request;
+  request.uri = path;
+  request.method = strcmp(path, "/") == 0 || strcmp(path, "/api/status") == 0 ? HTTP_GET : HTTP_POST;
+  request.body = body;
+  request.content_len = body.size();
+  if (authorized)
+    request.headers["X-Hexapod-Token"] = webTransport.token;
+  Fake::waitHook = serviceMainLoop ? loop : nullptr;
+  for (const auto& route : fakeHttpServer.routes)
+    if (strcmp(route.uri, path) == 0 && route.method == request.method)
+    {
+      request.user_ctx = route.user_ctx;
+      CHECK(route.handler(&request) == ESP_OK);
+      return request;
+    }
+  CHECK(false);
+  return request;
+}
+
+httpd_req_t webCommand(const std::string& command)
+{
+  return http("/api/command", std::to_string(webGeneration) + "\n" + command);
+}
+
+httpd_req_t webDrive(const std::string& axes, uint32_t generation)
+{
+  return http("/api/drive", std::to_string(generation) + "\n" + axes);
+}
+
+void prepareWebTest()
+{
+  send("off");
+  send("defaults");
+  send("init");
+  loop();
+  CHECK(apActive && Fake::apStarted && Fake::wifiMode == WIFI_AP_STA);
+  CHECK(Fake::channel == settings.radioChannel);
+}
+
+void testWebCommands()
+{
+  prepareWebTest();
+  const auto page = http("/");
+  CHECK(page.status == "200 OK" && page.contentType == "text/html; charset=utf-8");
+  CHECK(page.response.find("Hexapod control") != std::string::npos);
+  CHECK(page.responseHeaders.at("Cache-Control") == "no-store");
+  CHECK(page.responseHeaders.at("Content-Security-Policy").find("frame-ancestors 'none'") != std::string::npos);
+  const auto status = http("/api/status");
+  CHECK(status.status == "200 OK" && status.contentType == "application/json");
+  CHECK(status.response.find("\"mode\":\"off\"") != std::string::npos);
+  CHECK(status.response.find(webTransport.token) != std::string::npos);
+  CHECK(status.responseHeaders.at("X-Hexapod-Generation") == std::to_string(webGeneration));
+  CHECK(http("/api/command", "0\nweb", false).status == "403 Forbidden");
+  CHECK(http("/api/command", std::string(192, 'a')).status == "413 Content Too Large");
+  CHECK(http("/api/command", "").status == "413 Content Too Large");
+  CHECK(http("/api/command", "web").status == "400 Bad Request");
+  CHECK(http("/api/command", "4294967296\nweb").status == "400 Bad Request");
+  CHECK(webCommand("web\nservo rf coxa 90").status == "400 Bad Request");
+  CHECK(webCommand(std::string("we\0b", 4)).status == "400 Bad Request");
+  CHECK(webCommand(std::string(160, 'x')).status == "400 Bad Request");
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+
+  CHECK(webCommand("cal rf coxa 1000 2000 0 0").status == "200 OK");
+  CHECK(webCommand("cal rf coxa 2000 1000 0 0").status == "400 Bad Request");
+  CHECK(settings.servos[0][0].minUs == 1000 && settings.servos[0][0].maxUs == 2000);
+  CHECK(webCommand("set step_length 40").status == "200 OK" && settings.stepLength == 40);
+  CHECK(webCommand("set step_length nan").status == "400 Bad Request" && settings.stepLength == 40);
+  CHECK(webCommand("show").response.find("set step_length 40") != std::string::npos);
+  CHECK(webCommand("show").response.find("cal rf coxa 1000 2000 0 0") != std::string::npos);
+  CHECK(webCommand("params").status == "200 OK");
+  CHECK(webCommand("help").status == "200 OK");
+  CHECK(webCommand("servo rf coxa 90").status == "200 OK" && mode == Mode::Pose);
+  const auto blocked = webCommand("save");
+  CHECK(blocked.status == "400 Bad Request" && blocked.response.find("off first") != std::string::npos);
+  CHECK(webCommand("off").status == "200 OK");
+  Fake::storageFailure = true;
+  CHECK(webCommand("save").status == "400 Bad Request");
+  Fake::storageFailure = false;
+  CHECK(webCommand("defaults").status == "200 OK");
+  CHECK(webCommand("testservos").status == "200 OK");
+  runServoTestLeg(0);
+  CHECK(http("/api/status").response.find("\"mode\":\"testservos-paused\"") != std::string::npos);
+  CHECK(webCommand("retest").status == "200 OK");
+  checkServoTestOutput(0, 1500);
+  runServoTestLeg(0);
+  CHECK(webCommand("next").status == "200 OK");
+  checkServoTestOutput(3, 1500);
+  CHECK(webCommand("!").status == "200 OK" && mode == Mode::Off);
+}
+
+void testWebDrivingAndTimeout()
+{
+  prepareWebTest();
+  CHECK(webDrive("1 0", webGeneration).status == "409 Conflict");
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(mode == Mode::Web && Fake::outputEnable == LOW);
+  const uint32_t generation = webGeneration;
+  CHECK(webDrive("0.5 -0.5", generation).status == "200 OK");
+  CHECK(webMotion.direction == 0.5f && webMotion.rotation == -0.5f);
+  const uint32_t received = webMotion.receivedMs;
+  for (const char* axes : {"nan 0", "0 inf", "2 0", "0 -2", "1", "1 0 extra", "1 "})
+    CHECK(webDrive(axes, generation).status == "400 Bad Request");
+  CHECK(webMotion.receivedMs == received);
+  Fake::now = received + WEB_TIMEOUT_MS - 1;
+  loop();
+  CHECK(mode == Mode::Web);
+  loop();
+  CHECK(mode == Mode::Home && webMotion.direction == 0 && webMotion.rotation == 0);
+  CHECK(webDrive("1 0", generation).status == "409 Conflict");
+  CHECK(mode == Mode::Home);
+  CHECK(webCommand("web").status == "200 OK");
+  const uint32_t restartedGeneration = webGeneration;
+  CHECK(webDrive("1 0", generation).status == "409 Conflict");
+  CHECK(webDrive("1 0", restartedGeneration).status == "200 OK");
+  CHECK(webCommand("stop").status == "200 OK" && mode == Mode::Home);
+  CHECK(webDrive("1 0", restartedGeneration).status == "409 Conflict");
+  CHECK(webCommand("web").status == "200 OK");
+  send("off");
+  CHECK(webDrive("1 0", restartedGeneration).status == "409 Conflict");
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+
+  Fake::now = UINT32_MAX - 100;
+  CHECK(webCommand("web").status == "200 OK");
+  const uint32_t wrappedGeneration = webGeneration;
+  CHECK(webDrive("1 1", wrappedGeneration).status == "200 OK");
+  Fake::now = webMotion.receivedMs + WEB_TIMEOUT_MS;
+  loop();
+  CHECK(mode == Mode::Home && webGeneration != wrappedGeneration);
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(webDrive("1 0", webGeneration).status == "200 OK");
+  Fake::writeFailure = true;
+  Fake::now += settings.updateMs;
+  loop();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !servosReady);
+  CHECK(webCommand("web").status == "400 Bad Request");
+  Fake::writeFailure = false;
+  CHECK(webCommand("init").status == "200 OK");
+  loop();
+  CHECK(servosReady && apActive && mode == Mode::Off);
+}
+
+void testWebRadioPriority()
+{
+  prepareWebTest();
+  CHECK(webCommand("web").status == "200 OK");
+  const uint32_t generation = webGeneration;
+  CHECK(webDrive("1 -1", generation).status == "200 OK");
+  receive("invalid");
+  CHECK(apActive && mode == Mode::Web);
+  ControlPacket stale;
+  stale.receivedAtMs = millis() - settings.timeoutMs;
+  xQueueOverwrite(controlQueue, &stale);
+  loop();
+  CHECK(apActive && mode == Mode::Web);
+  receive("0,2047,0,2047,4095,2047,1,1,1,1");
+  CHECK(!apActive && !Fake::apStarted && Fake::wifiMode == WIFI_STA);
+  CHECK(mode == Mode::Radio && !control.armed && control.direction == 0 && control.rotation == 0);
+  CHECK(webMotion.direction == 0 && webMotion.rotation == 0);
+  CHECK(webDrive("1 -1", generation).status == "409 Conflict");
+  CHECK(webCommand("off").status == "409 Conflict");
+  receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+  CHECK(control.armed);
+  receive("0,2047,0,2047,4095,2047,1,1,1,1");
+  CHECK(control.direction == 1 && control.rotation == -1);
+  Fake::now = control.lastPacketMs + settings.timeoutMs - 1;
+  loop();
+  CHECK(!apActive);
+  loop();
+  CHECK(apActive && Fake::apStarted && !control.armed && control.direction == 0);
+  CHECK(webDrive("1 0", generation).status == "409 Conflict");
+  CHECK(mode == Mode::Radio);
+  CHECK(webCommand("web").status == "200 OK" && mode == Mode::Web);
+
+  for (const char* protectedCommand : {"off", "servo rf coxa 90", "testservos", "home", "walk 1 0 10000"})
+  {
+    send("off");
+    send(protectedCommand);
+    const Mode protectedMode = mode;
+    receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+    CHECK(mode == protectedMode && !apActive && !control.armed);
+    receive("0,2047,0,2047,4095,2047,1,1,1,1");
+    CHECK(mode == protectedMode && !control.armed);
+  }
+  send("off");
+}
+
+void testWebNetworkFailures()
+{
+  prepareWebTest();
+  receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+  CHECK(!apActive);
+  Fake::apFailure = true;
+  Fake::now += settings.timeoutMs;
+  loop();
+  CHECK(!apActive && !Fake::apStarted && Serial.output.find("cannot start fallback AP") != std::string::npos);
+  Fake::apFailure = false;
+  loop();
+  CHECK(!apActive);
+  Fake::now = lastApAttemptMs + AP_RETRY_MS;
+  loop();
+  CHECK(apActive && Fake::apStarted);
+  Fake::apStopFailure = true;
+  receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+  CHECK(apActive && Serial.output.find("cannot stop fallback AP") != std::string::npos);
+  CHECK(webCommand("web").status == "409 Conflict");
+  Fake::apStopFailure = false;
+  Fake::now += settings.timeoutMs;
+  loop();
+  CHECK(apActive && mode == Mode::Off);
+
+  Fake::httpReceiveDelayMs = WEB_REQUEST_MAX_AGE_MS;
+  CHECK(webCommand("web").status == "409 Conflict");
+  CHECK(mode == Mode::Off);
+  Fake::httpReceiveDelayMs = 0;
+  const uint32_t generation = webGeneration;
+  CHECK(http("/api/command", std::to_string(generation - 1) + "\nweb").status == "409 Conflict");
+  CHECK(mode == Mode::Off);
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(http("/api/command", std::to_string(generation) + "\noff").status == "200 OK");
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+
+  const auto timeout = http("/api/command", std::to_string(webGeneration) + "\nweb", true, false);
+  CHECK(timeout.status == "504 Gateway Timeout");
+  loop();
+  CHECK(mode == Mode::Off);
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(webCommand("off").status == "200 OK");
+  WebRequest queued;
+  queued.id = UINT32_MAX;
+  queued.receivedMs = millis();
+  CHECK(xQueueSend(webTransport.requests, &queued, 0) == pdPASS);
+  CHECK(webCommand("web").status == "503 Service Unavailable");
+  loop();
+  CHECK(mode == Mode::Off);
+
+  CHECK(webCommand("set radio_channel 6").status == "200 OK");
+  loop();
+  CHECK(!wifiReady && !radioReady && !apActive);
+  send("init");
+  loop();
+  CHECK(apActive && wifiReady && radioReady && Fake::channel == 6);
+  send("defaults");
+  send("init");
+}
+
 int main()
 {
   testBootAndPoses();
@@ -561,5 +811,9 @@ int main()
   testServoTestTimingAndFaults();
   testPersistence();
   testMotionAndRecovery();
-  puts("PASS: actual firmware console, disabled boot, poses, sequential servo tests, NVS failures/reboot, timed motion and fault recovery.");
+  testWebCommands();
+  testWebDrivingAndTimeout();
+  testWebRadioPriority();
+  testWebNetworkFailures();
+  puts("PASS: firmware console, servo tests, NVS, motion, web API, AP fallback, ESP-NOW priority and watchdog/fault recovery.");
 }

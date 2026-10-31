@@ -14,9 +14,13 @@
 #define M_PI 3.14159265358979323846
 #endif
 #define constrain(value, low, high) ((value) < (low) ? (low) : ((value) > (high) ? (high) : (value)))
-constexpr int HIGH = 1, LOW = 0, OUTPUT = 1, WIFI_STA = 1;
+constexpr int HIGH = 1, LOW = 0, OUTPUT = 1, WIFI_STA = 1, WIFI_AP_STA = 3;
 constexpr int ESP_OK = 0, WIFI_PS_NONE = 0, WIFI_SECOND_CHAN_NONE = 0;
 constexpr int pdPASS = 1, pdTRUE = 1, pdFALSE = 0;
+constexpr int ESP_FAIL = -1;
+using esp_err_t = int;
+#define PROGMEM
+#define pdMS_TO_TICKS(value) (value)
 
 namespace Fake
 {
@@ -29,6 +33,11 @@ inline std::vector<uint8_t> saved;
 inline unsigned saves = 0;
 inline uint16_t pwm[2][16] = {};
 inline uint8_t channel = 1;
+inline bool apStarted = false, apFailure = false, apStopFailure = false, httpFailure = false;
+inline int wifiMode = WIFI_STA;
+inline std::string apName;
+inline void (*waitHook)() = nullptr;
+inline uint32_t httpReceiveDelayMs = 0;
 }
 
 inline uint32_t millis() { return Fake::now; }
@@ -36,22 +45,45 @@ inline void delay(uint32_t ms) { Fake::now += ms; }
 inline void pinMode(int, int) {}
 inline void digitalWrite(int pin, int value) { if (pin == 23) Fake::outputEnable = value; }
 
-struct FakeSerial
+class Print
+{
+public:
+  virtual ~Print() = default;
+  virtual size_t write(uint8_t value) = 0;
+  virtual size_t write(const uint8_t* data, size_t size)
+  {
+    for (size_t i = 0; i < size; ++i)
+      write(data[i]);
+    return size;
+  }
+  void println(const char* text)
+  {
+    write(reinterpret_cast<const uint8_t*>(text), strlen(text));
+    write(uint8_t('\n'));
+  }
+  void printf(const char* format, ...)
+  {
+    char buffer[4096];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(buffer, sizeof(buffer), format, arguments);
+    va_end(arguments);
+    write(reinterpret_cast<const uint8_t*>(buffer), strlen(buffer));
+  }
+};
+
+struct FakeSerial : Print
 {
   std::deque<char> input;
   std::string output;
   void begin(int) {}
   int available() const { return int(input.size()); }
   int read() { const char value = input.front(); input.pop_front(); return value; }
-  void println(const char* text) { output += text; output += '\n'; }
-  void printf(const char* format, ...)
+  size_t write(uint8_t value) override { output += char(value); return 1; }
+  size_t write(const uint8_t* data, size_t size) override
   {
-    char buffer[2048];
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(buffer, sizeof(buffer), format, arguments);
-    va_end(arguments);
-    output += buffer;
+    output.append(reinterpret_cast<const char*>(data), size);
+    return size;
   }
 };
 inline FakeSerial Serial;
@@ -72,8 +104,27 @@ inline FakeWire Wire;
 
 struct FakeWiFi
 {
-  bool mode(int) { return !Fake::radioFailure; }
+  bool mode(int value) { Fake::wifiMode = value; return !Fake::radioFailure; }
   std::string macAddress() const { return "00:11:22:33:44:55"; }
+  bool softAP(const char* name, const char* password, int channel, int, int)
+  {
+    if (Fake::apFailure || password != nullptr)
+      return false;
+    Fake::apStarted = true;
+    Fake::apName = name;
+    Fake::channel = uint8_t(channel);
+    return true;
+  }
+  bool softAPdisconnect(bool)
+  {
+    if (Fake::apStopFailure)
+      return false;
+    Fake::apStarted = false;
+    Fake::wifiMode = WIFI_STA;
+    return true;
+  }
+  struct Address { std::string toString() const { return "192.168.4.1"; } };
+  Address softAPIP() const { return {}; }
 };
 inline FakeWiFi WiFi;
 inline int esp_wifi_set_ps(int) { return ESP_OK; }
@@ -88,8 +139,12 @@ struct FakeQueue
   bool available = false;
 };
 using QueueHandle_t = FakeQueue*;
-inline FakeQueue queue;
-inline QueueHandle_t xQueueCreate(int, size_t size) { queue.data.resize(size); return &queue; }
+inline QueueHandle_t xQueueCreate(int, size_t size)
+{
+  auto* queue = new FakeQueue;
+  queue->data.resize(size);
+  return queue;
+}
 inline int xQueueReset(QueueHandle_t handle) { handle->available = false; return pdPASS; }
 inline int xQueueOverwrite(QueueHandle_t handle, const void* packet)
 {
@@ -97,8 +152,19 @@ inline int xQueueOverwrite(QueueHandle_t handle, const void* packet)
   handle->available = true;
   return pdPASS;
 }
-inline int xQueueReceive(QueueHandle_t handle, void* packet, int)
+inline int xQueueSend(QueueHandle_t handle, const void* packet, int)
 {
+  return handle->available ? pdFALSE : xQueueOverwrite(handle, packet);
+}
+inline int xQueueReceive(QueueHandle_t handle, void* packet, int ticks)
+{
+  if (!handle->available && ticks > 0)
+  {
+    if (Fake::waitHook != nullptr)
+      Fake::waitHook();
+    if (!handle->available)
+      Fake::now += uint32_t(ticks);
+  }
   if (!handle->available)
     return pdFALSE;
   memcpy(packet, handle->data.data(), handle->data.size());

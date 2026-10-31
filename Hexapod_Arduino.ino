@@ -28,6 +28,7 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMA
 #include <atomic>
 #include <math.h>
 #include "HexapodConsole.h"
+#include "HexapodWeb.h"
 
 #define POW2(x)       ((x)*(x))
 
@@ -40,6 +41,15 @@ constexpr uint8_t DRIVER_ADDRESSES[DRIVER_COUNT] = {0x40, 0x41};
 Settings settings;
 Preferences preferences;
 ConsoleLine consoleLine;
+ConsoleOutput console;
+WebTransport webTransport;
+WebMotion webMotion;
+uint32_t webGeneration = 0;
+bool wifiReady = false;
+bool apActive = false;
+bool apRetryPending = false;
+uint32_t lastApAttemptMs = 0;
+char apName[32] = {};
 TimedMotion manualMotion;
 constexpr uint32_t SERVO_TEST_STEP_MS = 1000;
 constexpr float SERVO_TEST_ANGLES[] = {90.0f, 85.0f, 95.0f, 90.0f};
@@ -51,7 +61,9 @@ struct ServoTestState
   uint32_t startedMs = 0;
 };
 ServoTestState servoTest;
-enum class Mode { Off, Pose, Home, Radio, Walk, ServoTest, ServoTestPaused };
+enum class Mode { Off, Pose, Home, Radio, Walk, ServoTest, ServoTestPaused, Web };
+constexpr const char* MODE_NAMES[] = {"off", "pose", "home", "radio", "walk",
+                                    "testservos", "testservos-paused", "web"};
 Mode mode = Mode::Off;
 bool servosReady = false;
 bool radioReady = false;
@@ -104,11 +116,15 @@ Vector get_foot_target(float t, size_t legIndex, float direction, float rotation
 bool set_foot_positions(float direction, float rotation);
 void read_control();
 void read_console();
+void update_network();
+void read_web();
 
 void disable_outputs()
 {
   digitalWrite(SERVO_OE, HIGH);
   mode = Mode::Off;
+  ++webGeneration;
+  webMotion = WebMotion{};
   control = ControlState{};
   servoTest = ServoTestState{};
   memset(lastPulses, 0, sizeof(lastPulses));
@@ -118,7 +134,7 @@ bool servo_error(const char* message)
 {
   disable_outputs();
   servosReady = false;
-  Serial.printf("ERROR: %s Outputs disabled; fix wiring/settings, then use init.\n", message);
+  console.printf("ERROR: %s Outputs disabled; fix wiring/settings, then use init.\n", message);
   return false;
 }
 
@@ -126,7 +142,7 @@ bool require_off()
 {
   if (mode == Mode::Off)
     return true;
-  Serial.println("ERROR: use off first (support the robot; torque will be released).");
+  console.println("ERROR: use off first (support the robot; torque will be released).");
   return false;
 }
 
@@ -162,33 +178,47 @@ void on_control_received(const esp_now_recv_info_t*, const uint8_t* data, int le
 bool init_control()
 {
   radioReady = false;
+  wifiReady = false;
+  havePacket = false;
+  if (apActive)
+  {
+    if (!WiFi.softAPdisconnect(true))
+    {
+      console.println("ERROR: cannot stop fallback AP; retry init.");
+      return false;
+    }
+    apActive = false;
+    ++webGeneration;
+  }
+  apRetryPending = false;
   if (controlQueue == nullptr)
     controlQueue = xQueueCreate(1, sizeof(ControlPacket));
   if (controlQueue == nullptr || !WiFi.mode(WIFI_STA))
   {
-    Serial.println("ERROR: cannot allocate radio queue/start Wi-Fi.");
+    console.println("ERROR: cannot allocate radio queue/start Wi-Fi.");
     return false;
   }
   if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK ||
       esp_wifi_set_channel(uint8_t(settings.radioChannel), WIFI_SECOND_CHAN_NONE) != ESP_OK)
   {
-    Serial.println("ERROR: cannot configure ESP-NOW channel/power saving.");
+    console.println("ERROR: cannot configure ESP-NOW channel/power saving.");
     return false;
   }
-  Serial.printf("Receiver STA MAC: %s; ESP-NOW channel: %u\n",
+  wifiReady = true;
+  console.printf("Receiver STA MAC: %s; ESP-NOW channel: %u\n",
                 WiFi.macAddress().c_str(), unsigned(settings.radioChannel));
   if (!radioInitialized)
   {
     if (esp_now_init() != ESP_OK)
     {
-      Serial.println("ERROR: cannot initialize ESP-NOW.");
+      console.println("ERROR: cannot initialize ESP-NOW.");
       return false;
     }
     radioInitialized = true;
   }
   if (esp_now_register_recv_cb(on_control_received) != ESP_OK)
   {
-    Serial.println("ERROR: cannot register ESP-NOW receiver.");
+    console.println("ERROR: cannot register ESP-NOW receiver.");
     return false;
   }
   xQueueReset(controlQueue);
@@ -202,7 +232,7 @@ bool write_pulse(size_t legIndex, size_t jointIndex, uint16_t pulseUs)
 {
   if (!servosReady)
   {
-    Serial.println("ERROR: servo drivers not ready; use init.");
+    console.println("ERROR: servo drivers not ready; use init.");
     return false;
   }
   const size_t board = servoBoard(legIndex);
@@ -212,7 +242,7 @@ bool write_pulse(size_t legIndex, size_t jointIndex, uint16_t pulseUs)
     return servo_error("Servo pulse outside PCA9685 range.");
   if (pwm[board].setPWM(channel, 0, ticks) != 0)
   {
-    Serial.printf("PCA9685 write failed: address 0x%02X, channel %u\n",
+    console.printf("PCA9685 write failed: address 0x%02X, channel %u\n",
                   DRIVER_ADDRESSES[board], channel);
     return servo_error("I2C servo write failed.");
   }
@@ -251,7 +281,7 @@ bool init_servos()
   {
     if (!pwm[board].begin())
     {
-      Serial.printf("Missing PCA9685 at 0x%02X\n", DRIVER_ADDRESSES[board]);
+      console.printf("Missing PCA9685 at 0x%02X\n", DRIVER_ADDRESSES[board]);
       return servo_error("Check PCA9685 power, wiring and address jumpers.");
     }
     pwm[board].setOscillatorFrequency(settings.oscillatorHz(board));
@@ -265,7 +295,7 @@ bool init_servos()
   if (!clear_servo_outputs())
     return false;
   servosReady = true;
-  Serial.println("PCA9685 drivers ready; outputs remain disabled.");
+  console.println("PCA9685 drivers ready; outputs remain disabled.");
   return true;
 }
 
@@ -273,43 +303,43 @@ bool load_settings(Settings& loaded)
 {
   if (!storageReady)
   {
-    Serial.println("ERROR: flash settings storage unavailable.");
+    console.println("ERROR: flash settings storage unavailable.");
     return false;
   }
   if (!preferences.isKey("settings"))
   {
-    Serial.println("No saved settings.");
+    console.println("No saved settings.");
     return false;
   }
   SettingsRecord record;
   if (preferences.getBytesLength("settings") != sizeof(record) ||
       preferences.getBytes("settings", &record, sizeof(record)) != sizeof(record))
   {
-    Serial.println("ERROR: saved settings size/read failure; RAM settings unchanged.");
+    console.println("ERROR: saved settings size/read failure; RAM settings unchanged.");
     return false;
   }
   const char* error = nullptr;
   if (!decodeSettings(&record, sizeof(record), loaded, error))
   {
-    Serial.printf("ERROR: %s; RAM settings unchanged.\n", error);
+    console.printf("ERROR: %s; RAM settings unchanged.\n", error);
     return false;
   }
-  Serial.println("Settings loaded from flash; outputs remain disabled.");
+  console.println("Settings loaded from flash; outputs remain disabled.");
   return true;
 }
 
-void save_settings()
+bool save_settings()
 {
   if (!storageReady)
   {
-    Serial.println("ERROR: flash settings storage unavailable.");
-    return;
+    console.println("ERROR: flash settings storage unavailable.");
+    return false;
   }
   const char* error = nullptr;
   if (!validateSettings(settings, error))
   {
-    Serial.printf("ERROR: cannot save invalid settings: %s\n", error);
-    return;
+    console.printf("ERROR: cannot save invalid settings: %s\n", error);
+    return false;
   }
   const SettingsRecord record = makeSettingsRecord(settings);
   SettingsRecord readBack;
@@ -317,11 +347,12 @@ void save_settings()
       preferences.getBytes("settings", &readBack, sizeof(readBack)) != sizeof(readBack) ||
       memcmp(&record, &readBack, sizeof(record)) != 0)
   {
-    Serial.println("ERROR: settings save/read-back verification failed.");
-    return;
+    console.println("ERROR: settings save/read-back verification failed.");
+    return false;
   }
   settingsDirty = false;
-  Serial.println("Settings saved to flash and verified.");
+  console.println("Settings saved to flash and verified.");
+  return true;
 }
 
 void apply_settings(const Settings& candidate)
@@ -331,13 +362,16 @@ void apply_settings(const Settings& candidate)
       settings.servoHz != candidate.servoHz || settings.i2cHz != candidate.i2cHz)
     servosReady = false;
   if (settings.radioChannel != candidate.radioChannel)
+  {
     radioReady = false;
+    wifiReady = false;
+  }
   settings = candidate;
   settingsDirty = true;
   control = ControlState{};
   rebuild_geometry();
   if (!servosReady || !radioReady)
-    Serial.println("Hardware configuration pending: use init before enabling affected outputs/radio.");
+    console.println("Hardware configuration pending: use init before enabling affected outputs/radio.");
 }
 
 bool prepare_pose()
@@ -346,7 +380,7 @@ bool prepare_pose()
     return require_off();
   if (!servosReady)
   {
-    Serial.println("ERROR: servo drivers not ready; use init.");
+    console.println("ERROR: servo drivers not ready; use init.");
     return false;
   }
   return mode == Mode::Pose || clear_servo_outputs();
@@ -356,14 +390,14 @@ void enable_pose()
 {
   mode = Mode::Pose;
   digitalWrite(SERVO_OE, LOW);
-  Serial.println("Pose applied; ESP-NOW ignored. Other previously tested joints keep holding.");
+  console.println("Pose applied; ESP-NOW ignored. Other previously tested joints keep holding.");
 }
 
 void print_servo_test_step()
 {
   const size_t leg = servoTest.servoIndex / JOINT_COUNT;
   const size_t joint = servoTest.servoIndex % JOINT_COUNT;
-  Serial.printf("Servo test %u/%u: %s %s, address 0x%02X channel %u, nominal %.0f deg (%u us).\n",
+  console.printf("Servo test %u/%u: %s %s, address 0x%02X channel %u, nominal %.0f deg (%u us).\n",
       unsigned(servoTest.servoIndex + 1), unsigned(LEG_COUNT * JOINT_COUNT),
       LEG_NAMES[leg], JOINT_NAMES[joint], DRIVER_ADDRESSES[servoBoard(leg)],
       servoChannel(leg, joint), SERVO_TEST_ANGLES[servoTest.step], lastPulses[leg][joint]);
@@ -372,7 +406,7 @@ void print_servo_test_step()
 void print_servo_test_pause()
 {
   const size_t leg = servoTest.servoIndex / JOINT_COUNT;
-  Serial.printf("Leg %s test complete; outputs disabled. Paused: retest repeats this leg; next or Enter %s.\n",
+  console.printf("Leg %s test complete; outputs disabled. Paused: retest repeats this leg; next or Enter %s.\n",
       LEG_NAMES[leg], leg + 1 < LEG_COUNT ? "tests the next leg" : "finishes the sequence");
 }
 
@@ -389,37 +423,40 @@ bool apply_servo_test_step()
   return true;
 }
 
-void start_servo_test()
+bool start_servo_test()
 {
   if (!require_off() || !prepare_pose())
-    return;
+    return false;
   servoTest = ServoTestState{};
   if (!apply_servo_test_step())
-    return;
-  Serial.println("Servo test started: one joint at a time, 90/85/95/90 deg, 1000 ms each."
+    return false;
+  console.println("Servo test started: one joint at a time, 90/85/95/90 deg, 1000 ms each."
                  " Pauses after each leg: retest repeats it, next or Enter advances."
                  " Support the robot; stop holds the current joint, !/off disables outputs.");
   print_servo_test_step();
+  return true;
 }
 
-void resume_servo_test(bool retest)
+bool resume_servo_test(bool retest)
 {
   if (mode != Mode::ServoTestPaused)
   {
-    Serial.println("ERROR: next/retest requires testservos paused after a leg.");
-    return;
+    console.println("ERROR: next/retest requires testservos paused after a leg.");
+    return false;
   }
   if (retest)
     servoTest.servoIndex = (servoTest.servoIndex / JOINT_COUNT) * JOINT_COUNT;
   else if (++servoTest.servoIndex == LEG_COUNT * JOINT_COUNT)
   {
     disable_outputs();
-    Serial.println("Servo test complete; outputs disabled. Radio remains ignored.");
-    return;
+    console.println("Servo test complete; outputs disabled. Radio remains ignored.");
+    return true;
   }
   servoTest.step = 0;
-  if (apply_servo_test_step())
-    print_servo_test_step();
+  if (!apply_servo_test_step())
+    return false;
+  print_servo_test_step();
+  return true;
 }
 
 void update_servo_test(uint32_t now)
@@ -456,7 +493,7 @@ bool enter_home()
 {
   if (!servosReady)
   {
-    Serial.println("ERROR: servo drivers not ready; use init.");
+    console.println("ERROR: servo drivers not ready; use init.");
     return false;
   }
   if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest ||
@@ -469,28 +506,29 @@ bool enter_home()
     digitalWrite(SERVO_OE, LOW);
   }
   control = ControlState{};
+  webMotion = WebMotion{};
   mode = Mode::Home;
   return true;
 }
 
 void print_status()
 {
-  const char* names[] = {"off", "pose", "home", "radio", "walk", "testservos", "testservos-paused"};
-  Serial.printf("mode=%s OE=%s drivers=%s radio=%s unsaved=%s MAC=%s\n",
-      names[size_t(mode)], mode == Mode::Off || mode == Mode::ServoTestPaused ? "HIGH" : "LOW",
+  console.printf("mode=%s OE=%s drivers=%s radio=%s unsaved=%s MAC=%s\n",
+      MODE_NAMES[size_t(mode)], mode == Mode::Off || mode == Mode::ServoTestPaused ? "HIGH" : "LOW",
       servosReady ? "ready" : "init-needed", radioReady ? "ready" : "init-needed",
       settingsDirty ? "yes" : "no", WiFi.macAddress().c_str());
-  Serial.printf("armed=%u direction=%.2f rotation=%.2f configured-channel=%u\n", control.armed,
-      mode == Mode::Walk ? manualMotion.direction : control.direction,
-      mode == Mode::Walk ? manualMotion.rotation : control.rotation, unsigned(settings.radioChannel));
+  console.printf("armed=%u direction=%.2f rotation=%.2f configured-channel=%u AP=%s\n", control.armed,
+      mode == Mode::Web ? webMotion.direction : (mode == Mode::Walk ? manualMotion.direction : control.direction),
+      mode == Mode::Web ? webMotion.rotation : (mode == Mode::Walk ? manualMotion.rotation : control.rotation),
+      unsigned(settings.radioChannel), apActive ? apName : "off");
   if (havePacket)
   {
-    Serial.printf("last valid RX age=%lu ms CSV=", static_cast<unsigned long>(millis() - lastPacket.receivedAtMs));
+    console.printf("last valid RX age=%lu ms CSV=", static_cast<unsigned long>(millis() - lastPacket.receivedAtMs));
     for (size_t i = 0; i < CONTROL_CHANNEL_COUNT; ++i)
-      Serial.printf(i + 1 == CONTROL_CHANNEL_COUNT ? "%u\n" : "%u,", lastPacket.channels[i]);
+      console.printf(i + 1 == CONTROL_CHANNEL_COUNT ? "%u\n" : "%u,", lastPacket.channels[i]);
   }
   else
-    Serial.println("No valid RX packet since initialization.");
+    console.println("No valid RX packet since initialization.");
   if (mode == Mode::ServoTest)
     print_servo_test_step();
   else if (mode == Mode::ServoTestPaused)
@@ -498,13 +536,13 @@ void print_status()
   if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest ||
       mode == Mode::ServoTestPaused)
     for (size_t leg = 0; leg < LEG_COUNT; ++leg)
-      Serial.printf("%s commanded us (0=off): %u %u %u\n", LEG_NAMES[leg],
+      console.printf("%s commanded us (0=off): %u %u %u\n", LEG_NAMES[leg],
                     lastPulses[leg][0], lastPulses[leg][1], lastPulses[leg][2]);
 }
 
 void print_help()
 {
-  Serial.println(
+  console.println(
       "Commands (newline or CRLF, 115200 baud):\n"
       "  help | status | params | show\n"
       "  off | ! (immediate disable; finish with newline) | stop (return home if walking)\n"
@@ -513,11 +551,13 @@ void print_help()
       "  next (or Enter on an empty line) | retest (only at the pause after each leg; outputs disabled while paused)\n"
       "  joints LEG COXA FEMUR TIBIA | foot LEG DX DY DZ (offset mm from home)\n"
       "  home | radio | walk DIRECTION ROTATION DURATION_MS (100..10000)\n"
+      "  web (enable browser driving while fallback AP is available)\n"
       "  set NAME VALUE | cal LEG JOINT MIN_US MAX_US TRIM REVERSE\n"
       "  origin LEG X Y | save | load | defaults | init | scan\n"
       "LEG=rf/rm/rr/lr/lm/lf or 0..5; JOINT=coxa/femur/tibia or 0..2.\n"
       "Use off before configuration, storage, scan, init, help, params or show.\n"
       "Direct joint tests require off/pose. walk/home/radio explicitly take control.\n"
+      "Open fallback AP: http://192.168.4.1. Fresh ESP-NOW disables AP and takes over web driving.\n"
       "next or Enter advances/finishes testservos; retest repeats the paused leg.\n"
       "stop cancels testservos holding the active joint or staying off if paused.\n"
       "Only save writes settings. Boot always stays off; !/off releases torque.");
@@ -528,49 +568,58 @@ void show_settings(bool ranges)
   for (const FloatParameter& parameter : FLOAT_PARAMETERS)
   {
     if (ranges)
-      Serial.printf("%s: %.9g..%.9g\n", parameter.name, parameter.minimum, parameter.maximum);
+      console.printf("%s: %.9g..%.9g\n", parameter.name, parameter.minimum, parameter.maximum);
     else
-      Serial.printf("set %s %.9g\n", parameter.name, settings.*(parameter.member));
+      console.printf("set %s %.9g\n", parameter.name, settings.*(parameter.member));
   }
   for (const IntegerParameter& parameter : INTEGER_PARAMETERS)
   {
     if (ranges)
-      Serial.printf("%s: %lu..%lu (integer)\n", parameter.name,
+      console.printf("%s: %lu..%lu (integer)\n", parameter.name,
                     static_cast<unsigned long>(parameter.minimum), static_cast<unsigned long>(parameter.maximum));
     else
-      Serial.printf("set %s %lu\n", parameter.name,
+      console.printf("set %s %lu\n", parameter.name,
                     static_cast<unsigned long>(settings.*(parameter.member)));
   }
   if (ranges)
     return;
   for (size_t leg = 0; leg < LEG_COUNT; ++leg)
   {
-    Serial.printf("origin %s %.9g %.9g\n", LEG_NAMES[leg], settings.origins[leg].x, settings.origins[leg].y);
+    console.printf("origin %s %.9g %.9g\n", LEG_NAMES[leg], settings.origins[leg].x, settings.origins[leg].y);
     for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
     {
       const ServoCalibration& calibration = settings.servos[leg][joint];
-      Serial.printf("cal %s %s %u %u %.9g %u\n", LEG_NAMES[leg], JOINT_NAMES[joint],
+      console.printf("cal %s %s %u %u %.9g %u\n", LEG_NAMES[leg], JOINT_NAMES[joint],
           calibration.minUs, calibration.maxUs, calibration.trimDegrees, calibration.reversed);
     }
   }
 }
 
-void execute_command(const Command& command)
+bool radio_active(uint32_t now)
 {
+  return radioReady && havePacket &&
+      uint32_t(now - lastPacket.receivedAtMs) < settings.timeoutMs;
+}
+
+bool execute_command(const Command& command)
+{
+  if (command.type != CommandType::Status && command.type != CommandType::Help &&
+      command.type != CommandType::Show && command.type != CommandType::Params)
+    ++webGeneration;
   if (command.type == CommandType::Off)
   {
     disable_outputs();
-    Serial.println("Outputs disabled.");
-    return;
+    console.println("Outputs disabled.");
+    return true;
   }
   if (command.type == CommandType::Status)
   {
     print_status();
-    return;
+    return true;
   }
   if (command.type == CommandType::Stop)
   {
-    if (mode == Mode::Radio || mode == Mode::Walk)
+    if (mode == Mode::Radio || mode == Mode::Walk || mode == Mode::Web)
       mode = Mode::Home;
     else if (mode == Mode::ServoTest)
     {
@@ -580,48 +629,58 @@ void execute_command(const Command& command)
     else if (mode == Mode::ServoTestPaused)
     {
       disable_outputs();
-      Serial.println("Servo test cancelled; outputs remain disabled.");
-      return;
+      console.println("Servo test cancelled; outputs remain disabled.");
+      return true;
     }
     control = ControlState{};
-    Serial.println("Motion stopped; current pose/home held unless outputs were already off.");
-    return;
+    webMotion = WebMotion{};
+    console.println("Motion stopped; current pose/home held unless outputs were already off.");
+    return true;
   }
   if (command.type == CommandType::TestServos)
   {
-    start_servo_test();
-    return;
+    return start_servo_test();
   }
   if (command.type == CommandType::Next || command.type == CommandType::Retest)
   {
-    resume_servo_test(command.type == CommandType::Retest);
-    return;
+    return resume_servo_test(command.type == CommandType::Retest);
   }
   if (command.type == CommandType::Home || command.type == CommandType::Radio ||
-      command.type == CommandType::Walk)
+      command.type == CommandType::Walk || command.type == CommandType::Web)
   {
     if (command.type == CommandType::Radio && !radioReady)
     {
-      Serial.println("ERROR: radio not ready; use off then init.");
-      return;
+      console.println("ERROR: radio not ready; use off then init.");
+      return false;
+    }
+    if (command.type == CommandType::Web && (!apActive || !wifiReady || radio_active(millis())))
+    {
+      console.println("ERROR: web control requires the fallback AP and no active ESP-NOW signal.");
+      return false;
     }
     if (!enter_home())
-      return;
+      return false;
     if (command.type == CommandType::Radio)
     {
       xQueueReset(controlQueue);
       mode = Mode::Radio;
-      Serial.println("ESP-NOW mode: center sticks to arm. Serial tests do not resume radio automatically.");
+      console.println("ESP-NOW mode: center sticks to arm. Serial tests do not resume radio automatically.");
     }
     else if (command.type == CommandType::Walk)
     {
       manualMotion = {command.values[0], command.values[1], millis(), command.durationMs};
       mode = Mode::Walk;
-      Serial.println("Timed walking test started; stop returns home, ! disables outputs.");
+      console.println("Timed walking test started; stop returns home, ! disables outputs.");
+    }
+    else if (command.type == CommandType::Web)
+    {
+      mode = Mode::Web;
+      webMotion.receivedMs = millis();
+      console.println("Web driving enabled at home; hold a direction on the page. Link loss stops motion.");
     }
     else
-      Serial.println("Home stance enabled; radio ignored.");
-    return;
+      console.println("Home stance enabled; radio ignored.");
+    return true;
   }
   if (command.type == CommandType::Center || command.type == CommandType::Servo ||
       command.type == CommandType::Pulse || command.type == CommandType::Joints ||
@@ -633,8 +692,8 @@ void execute_command(const Command& command)
       const ServoCalibration& calibration = settings.servos[command.leg][command.joint];
       if (command.values[0] < calibration.minUs || command.values[0] > calibration.maxUs)
       {
-        Serial.println("ERROR: pulse outside this servo's calibrated min/max; use cal while off.");
-        return;
+        console.println("ERROR: pulse outside this servo's calibrated min/max; use cal while off.");
+        return false;
       }
     }
     if (command.type == CommandType::Foot)
@@ -648,8 +707,8 @@ void execute_command(const Command& command)
       if (distance <= fabsf(settings.femurLength - settings.tibiaLength) + 0.001f ||
           distance >= settings.femurLength + settings.tibiaLength - 0.001f)
       {
-        Serial.println("ERROR: foot target outside leg reach.");
-        return;
+        console.println("ERROR: foot target outside leg reach.");
+        return false;
       }
       calculate_ik(testLeg, angles);
       angles = Vector(90 + angles.x, 90 + angles.y, fabsf(angles.z));
@@ -657,29 +716,29 @@ void execute_command(const Command& command)
           angles.x < settings.coxaMin || angles.x > settings.coxaMax ||
           angles.y < 0 || angles.y > 180 || angles.z < 0 || angles.z > 180)
       {
-        Serial.println("ERROR: foot target outside joint angle limits.");
-        return;
+        console.println("ERROR: foot target outside joint angle limits.");
+        return false;
       }
     }
     if (!prepare_pose())
-      return;
+      return false;
     if (command.type == CommandType::Center)
     {
       for (size_t leg = 0; leg < LEG_COUNT; ++leg)
         if (command.leg == LEG_COUNT || command.leg == leg)
           for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
             if (!write_servo(leg, joint, 90))
-              return;
+              return false;
     }
     else if (command.type == CommandType::Servo)
     {
       if (!write_servo(command.leg, command.joint, command.values[0]))
-        return;
+        return false;
     }
     else if (command.type == CommandType::Pulse)
     {
       if (!write_pulse(command.leg, command.joint, uint16_t(command.values[0])))
-        return;
+        return false;
     }
     else
     {
@@ -687,27 +746,32 @@ void execute_command(const Command& command)
       for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
         if (!write_servo(command.leg, joint,
                          command.type == CommandType::Foot ? values[joint] : command.values[joint]))
-          return;
+          return false;
     }
     enable_pose();
-    return;
+    return true;
   }
 
   if (!require_off())
-    return;
+    return false;
   switch (command.type)
   {
     case CommandType::Help: print_help(); break;
     case CommandType::Show: show_settings(false); break;
     case CommandType::Params: show_settings(true); break;
-    case CommandType::Save: save_settings(); break;
+    case CommandType::Save: return save_settings();
     case CommandType::Init:
-      init_control();
-      init_servos();
-      break;
+    {
+      const bool radioOk = init_control();
+      const bool servosOk = init_servos();
+      return radioOk && servosOk;
+    }
     case CommandType::Scan:
       if (!wireReady)
-        Serial.println("ERROR: I2C not initialized; use init.");
+      {
+        console.println("ERROR: I2C not initialized; use init.");
+        return false;
+      }
       else
       {
         unsigned found = 0;
@@ -717,31 +781,30 @@ void execute_command(const Command& command)
           const uint8_t result = Wire.endTransmission();
           if (result == 0)
           {
-            Serial.printf("I2C device: 0x%02X\n", address);
+            console.printf("I2C device: 0x%02X\n", address);
             ++found;
           }
           else if (result != 2)
           {
-            Serial.printf("ERROR: I2C scan failed at 0x%02X, code %u\n", address, result);
-            return;
+            console.printf("ERROR: I2C scan failed at 0x%02X, code %u\n", address, result);
+            return false;
           }
         }
-        Serial.printf("Scan complete: %u responding address(es).\n", found);
+        console.printf("Scan complete: %u responding address(es).\n", found);
       }
       break;
     case CommandType::Load:
     {
       Settings loaded;
-      if (load_settings(loaded))
-      {
-        apply_settings(loaded);
-        settingsDirty = false;
-      }
+      if (!load_settings(loaded))
+        return false;
+      apply_settings(loaded);
+      settingsDirty = false;
       break;
     }
     case CommandType::Defaults:
       apply_settings(Settings{});
-      Serial.println("Factory defaults in RAM only; save to replace saved settings.");
+      console.println("Factory defaults in RAM only; save to replace saved settings.");
       break;
     case CommandType::Set:
     case CommandType::Calibrate:
@@ -753,8 +816,8 @@ void execute_command(const Command& command)
       {
         if (!setParameter(candidate, command.name, command.text, error))
         {
-          Serial.printf("ERROR: %s\n", error);
-          return;
+          console.printf("ERROR: %s\n", error);
+          return false;
         }
       }
       else if (command.type == CommandType::Calibrate)
@@ -764,15 +827,16 @@ void execute_command(const Command& command)
         candidate.origins[command.leg] = {command.values[0], command.values[1]};
       if (!validateSettings(candidate, error))
       {
-        Serial.printf("ERROR: %s\n", error);
-        return;
+        console.printf("ERROR: %s\n", error);
+        return false;
       }
       apply_settings(candidate);
-      Serial.println("Setting updated in RAM; use save to persist.");
+      console.println("Setting updated in RAM; use save to persist.");
       break;
     }
-    default: Serial.println("ERROR: unsupported command."); break;
+    default: console.println("ERROR: unsupported command."); return false;
   }
+  return true;
 }
 
 void read_console()
@@ -783,12 +847,12 @@ void read_console()
     if (event == LineEvent::Disable)
     {
       disable_outputs();
-      Serial.println("Outputs disabled. Finish the line before the next command.");
+      console.println("Outputs disabled. Finish the line before the next command.");
       return;
     }
     if (event == LineEvent::Overflow || event == LineEvent::Invalid)
     {
-      Serial.println("ERROR: invalid/overlong line discarded; finish with newline.");
+      console.println("ERROR: invalid/overlong line discarded; finish with newline.");
       return;
     }
     if (event == LineEvent::Empty)
@@ -804,10 +868,161 @@ void read_console()
       if (parseCommand(consoleLine.data, command, error))
         execute_command(command);
       else
-        Serial.printf("ERROR: %s\n", error);
+        console.printf("ERROR: %s\n", error);
       return;
     }
   }
+}
+
+void update_network()
+{
+  const uint32_t now = millis();
+  const bool wanted = wifiReady && !radio_active(now);
+  if (wanted == apActive)
+  {
+    apRetryPending = false;
+    return;
+  }
+  if (apRetryPending && uint32_t(now - lastApAttemptMs) < AP_RETRY_MS)
+    return;
+  lastApAttemptMs = now;
+  apRetryPending = true;
+  if (!wanted)
+  {
+    if (!WiFi.softAPdisconnect(true))
+    {
+      console.println("ERROR: cannot stop fallback AP; web commands remain blocked. Retrying.");
+      return;
+    }
+    apActive = false;
+    ++webGeneration;
+    console.println("Fallback AP off; ESP-NOW has priority (or Wi-Fi needs init).");
+  }
+  else
+  {
+    if (!webTransport.begin())
+    {
+      console.println("ERROR: cannot start web server/queues; retrying.");
+      return;
+    }
+    const auto mac = WiFi.macAddress();
+    snprintf(apName, sizeof(apName), "Hexapod-%c%c%c%c%c%c",
+        mac[9], mac[10], mac[12], mac[13], mac[15], mac[16]);
+    if (!WiFi.mode(WIFI_AP_STA) ||
+        !WiFi.softAP(apName, nullptr, int(settings.radioChannel), 0, 1))
+    {
+      console.println("ERROR: cannot start fallback AP; retrying.");
+      if (!WiFi.softAPdisconnect(true))
+        console.println("ERROR: cannot clean up failed AP startup.");
+      return;
+    }
+    apActive = true;
+    ++webGeneration;
+    console.printf("Open AP %s: http://%s (no password; nearby devices can control the robot).\n",
+        apName, WiFi.softAPIP().toString().c_str());
+  }
+  apRetryPending = false;
+}
+
+void process_web_request(WebRequest& request, WebResponse& response)
+{
+  if (!apActive || !wifiReady || radio_active(millis()))
+  {
+    response.code = 409;
+    console.println("ERROR: web unavailable; ESP-NOW takes precedence or Wi-Fi needs init.");
+    return;
+  }
+  if (uint32_t(millis() - request.receivedMs) >= WEB_REQUEST_MAX_AGE_MS)
+  {
+    response.code = 409;
+    console.println("ERROR: expired web request; retry explicitly.");
+    return;
+  }
+  if (request.type == WebRequestType::Status)
+  {
+    snprintf(response.body, sizeof(response.body),
+        "{\"mode\":\"%s\",\"generation\":%lu,\"token\":\"%s\",\"drivers\":%s,"
+        "\"radioReady\":%s,\"radio\":false,\"dirty\":%s,\"leg\":\"%s\",\"joint\":\"%s\","
+        "\"step\":%u,\"direction\":%.2f,\"rotation\":%.2f}",
+        MODE_NAMES[size_t(mode)], static_cast<unsigned long>(webGeneration), webTransport.token,
+        servosReady ? "true" : "false", radioReady ? "true" : "false",
+        settingsDirty ? "true" : "false", LEG_NAMES[servoTest.servoIndex / JOINT_COUNT],
+        JOINT_NAMES[servoTest.servoIndex % JOINT_COUNT], unsigned(servoTest.step),
+        mode == Mode::Web ? webMotion.direction : control.direction,
+        mode == Mode::Web ? webMotion.rotation : control.rotation);
+    return;
+  }
+  uint32_t generation = 0;
+  char* payload = nullptr;
+  if (!parseWebEnvelope(request.body, generation, payload))
+  {
+    response.code = 400;
+    console.println("ERROR: malformed web command.");
+    return;
+  }
+  Command command;
+  if (request.type == WebRequestType::Command)
+  {
+    const char* error = nullptr;
+    if (strcmp(payload, "!") == 0)
+      command.type = CommandType::Off;
+    else if (!parseCommand(payload, command, error))
+    {
+      response.code = 400;
+      console.printf("ERROR: %s\n", error);
+      return;
+    }
+  }
+  const bool stopping = request.type == WebRequestType::Command &&
+      (command.type == CommandType::Off || command.type == CommandType::Stop);
+  if (generation != webGeneration && !stopping)
+  {
+    response.code = 409;
+    console.println("ERROR: control source changed; refresh status and explicitly enable again.");
+    return;
+  }
+  if (request.type == WebRequestType::Drive)
+  {
+    float direction = 0, rotation = 0;
+    if (!parseWebMotion(payload, direction, rotation))
+    {
+      response.code = 400;
+      console.println("ERROR: drive requires direction and rotation in -1..1.");
+    }
+    else if (mode != Mode::Web)
+    {
+      response.code = 409;
+      console.println("ERROR: explicitly enable web driving first.");
+    }
+    else
+      webMotion = {direction, rotation, millis()};
+    return;
+  }
+  if (!execute_command(command))
+    response.code = 400;
+}
+
+void read_web()
+{
+  WebRequest request;
+  if (webTransport.requests == nullptr ||
+      xQueueReceive(webTransport.requests, &request, 0) != pdTRUE)
+    return;
+  static WebResponse response;
+  response = WebResponse{};
+  response.id = request.id;
+  console.capture(response.body, sizeof(response.body));
+  process_web_request(request, response);
+  if (console.truncated)
+  {
+    response.code = 500;
+    const char suffix[] = "\nERROR: response truncated; use the serial console.\n";
+    memcpy(response.body + sizeof(response.body) - sizeof(suffix), suffix, sizeof(suffix));
+  }
+  console.capture(nullptr, 0);
+  response.generation = webGeneration;
+  if (xQueueOverwrite(webTransport.responses, &response) != pdPASS)
+    console.println("ERROR: cannot publish web response.");
 }
 
 void setup()
@@ -815,31 +1030,43 @@ void setup()
   pinMode(SERVO_OE, OUTPUT);
   disable_outputs();
   Serial.begin(115200);
-  Serial.println("Hexapod serial console. Boot is always OFF; type help.");
+  console.println("Hexapod serial console. Boot is always OFF; type help.");
   storageReady = preferences.begin("hexapod", false);
   if (!load_settings(settings))
-    Serial.println("Using factory defaults in RAM; outputs remain disabled.");
+    console.println("Using factory defaults in RAM; outputs remain disabled.");
   rebuild_geometry();
   init_control();
   init_servos();
+  update_network();
   lastUpdateMs = millis();
 }
 
 void loop()
 {
   read_control();
+  update_network();
+  if (mode == Mode::Web && uint32_t(millis() - webMotion.receivedMs) >= WEB_TIMEOUT_MS)
+  {
+    webMotion = WebMotion{};
+    mode = Mode::Home;
+    ++webGeneration;
+    console.println("Web control timeout: returning home; explicitly enable web driving again.");
+  }
   if (mode == Mode::Walk && manualMotion.expired(millis()))
   {
     mode = Mode::Home;
-    Serial.println("Walking test complete; returning home. Radio remains ignored.");
+    console.println("Walking test complete; returning home. Radio remains ignored.");
   }
   read_console();
+  read_web();
   const uint32_t now = millis();
   update_servo_test(now);
   if (uint32_t(now - lastUpdateMs) >= settings.updateMs)
   {
     lastUpdateMs = now;
-    if (mode == Mode::Radio)
+    if (mode == Mode::Web)
+      set_foot_positions(webMotion.direction, webMotion.rotation);
+    else if (mode == Mode::Radio)
       set_foot_positions(control.direction, control.rotation);
     else if (mode == Mode::Walk)
       set_foot_positions(manualMotion.direction, manualMotion.rotation);
@@ -853,20 +1080,33 @@ void read_control()
 {
   const uint32_t now = millis();
   if (mode == Mode::Radio && control.expire(now, settings.timeoutMs))
-    Serial.println("ESP-NOW timeout: returning home; center sticks to re-arm.");
+    console.println("ESP-NOW timeout: returning home; center sticks to re-arm.");
 
   ControlPacket packet;
   if (controlQueue != nullptr && xQueueReceive(controlQueue, &packet, 0) == pdTRUE)
   {
-    lastPacket = packet;
-    havePacket = true;
-    const bool wasArmed = control.armed;
-    if (mode == Mode::Radio)
+    if (!radioReady || uint32_t(now - packet.receivedAtMs) >= settings.timeoutMs)
+      console.println("Discarded stale/unavailable ESP-NOW packet.");
+    else
     {
-      if (!control.receive(packet, millis(), settings))
-        Serial.println("Discarded stale ESP-NOW packet.");
-      else if (!wasArmed && control.armed)
-        Serial.println("ESP-NOW control armed.");
+      lastPacket = packet;
+      havePacket = true;
+      if (mode == Mode::Web)
+      {
+        webMotion = WebMotion{};
+        control = ControlState{};
+        mode = Mode::Radio;
+        ++webGeneration;
+        console.println("ESP-NOW takes precedence over web driving; center sticks to arm.");
+      }
+      const bool wasArmed = control.armed;
+      if (mode == Mode::Radio)
+      {
+        if (!control.receive(packet, millis(), settings))
+          console.println("Discarded stale ESP-NOW packet.");
+        else if (!wasArmed && control.armed)
+          console.println("ESP-NOW control armed.");
+      }
     }
   }
 
@@ -876,7 +1116,7 @@ void read_control()
     lastReportMs = now;
     const uint32_t rejected = rejectedPackets.exchange(0, std::memory_order_relaxed);
     if (rejected != 0)
-      Serial.printf("Rejected %lu ESP-NOW packet(s); expected ten valid CSV fields.\n",
+      console.printf("Rejected %lu ESP-NOW packet(s); expected ten valid CSV fields.\n",
                     static_cast<unsigned long>(rejected));
   }
 }

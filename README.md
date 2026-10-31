@@ -8,7 +8,7 @@ Firmware for the [original printed hexapod](https://makerworld.com/en/models/197
 - Eighteen **positional MG996R** servos, three per leg (not continuous-rotation servos).
 - The CyberBrick ESP-NOW transmitter in [espnow/tx/tx.py](espnow/tx/tx.py).
 
-The original leg geometry, inverse kinematics, alternating-tripod gait, step dimensions and smoothing are the defaults. All motion/calibration parameters can be adjusted over the serial console and explicitly saved to ESP32 flash. Direct GPIO servo output, Mega pin assignments, SPI/nRF24L01 control and unused forward-kinematics intermediates have been removed. The ESP32's built-in radio replaces the nRF24L01; no separate radio module is connected.
+The original leg geometry, inverse kinematics, alternating-tripod gait, step dimensions and smoothing are the defaults. All motion/calibration parameters can be adjusted over the serial console or the ESP32-hosted webpage and explicitly saved to ESP32 flash. An open fallback Wi-Fi AP provides browser control whenever no fresh ESP-NOW signal is present. Direct GPIO servo output, Mega pin assignments, SPI/nRF24L01 control and unused forward-kinematics intermediates have been removed. The ESP32's built-in radio replaces the nRF24L01; no separate radio module is connected.
 
 ## 1. Power first
 
@@ -273,6 +273,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `home` | Enable all legs at the home stance; ignore radio |
 | `walk DIRECTION ROTATION DURATION_MS` | Serial walking/turning test; each command axis -1..1; mandatory duration **100..10000 ms**, then return toward home |
 | `radio` | Enable home stance, select radio, discard queued commands and require neutral sticks before arming |
+| `web` | Enable home stance and browser driving; requires the fallback AP and no fresh ESP-NOW signal |
 | `set NAME VALUE` | Change one named parameter in RAM (while off) |
 | `cal LEG JOINT MIN_US MAX_US TRIM REVERSE` | Set a complete joint calibration: `500 <= MIN_US < MAX_US <= 2500`, trim -90..90 degrees, reverse 0/1 (while off) |
 | `origin LEG X Y` | Set a leg's body mounting location, each coordinate -500..500 mm, at least 1 mm from body center (while off) |
@@ -282,9 +283,9 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `init` | Reinitialize radio/drivers with current settings, clear PWM registers, leave outputs off |
 | `scan` | Scan the I2C bus while off; normally 0x40/0x41 and possibly 0x70 |
 
-Direct servo/foot tests require **off or pose** mode; send `off` first if home/radio/walking, or cancel `testservos` with `off`/`stop`. The first pose command after off clears stale PWM outputs so unrelated joints do not unexpectedly re-enable. `home`, `walk` and `radio` explicitly select their control source and enable all legs; moving from a direct pose to home can move joints abruptly. Support the robot. Neither completion of a serial test nor a reconnect automatically resumes radio control.
+Direct servo/foot tests require **off or pose** mode; send `off` first if home/radio/web/walking, or cancel `testservos` with `off`/`stop`. The first pose command after off clears stale PWM outputs so unrelated joints do not unexpectedly re-enable. `home`, `walk`, `radio` and `web` explicitly select their control source and enable all legs; moving from a direct pose to home can move joints abruptly. Support the robot. Completion of a serial test does not automatically resume radio control. ESP-NOW may take over active **web driving** only, after neutral-stick arming; it never enables outputs from off or interrupts serial tests.
 
-Long diagnostics/configuration/flash operations require off so they cannot block an active gait. Input processing is bounded and non-blocking; partial lines do not pause the gait, radio watchdog or test deadline. Durations and radio timeouts are serviced by the main loop, not hard-real-time timers.
+Long diagnostics/configuration/flash operations require off so they cannot block an active gait. Input processing is bounded and non-blocking; partial lines do not pause the gait, radio watchdog or test deadline. HTTP socket I/O runs on the ESP-IDF HTTP server task, with bounded request/response queues; all command execution and servo writes remain in the main loop. Durations and radio/browser timeouts are serviced by the main loop, not hard-real-time timers.
 
 ### Parameters
 
@@ -350,12 +351,33 @@ Send commands individually and inspect each result. Only increase a test's ampli
 
 Valid settings load automatically on boot, **but output enable state, pose, arming and motion commands are never saved**. Every reset starts off. Missing saved data uses documented defaults; corrupt/incompatible records or storage errors are reported. At boot those errors leave factory defaults active with outputs disabled; at runtime a failed load retains the current settings. A future incompatible settings layout needs a new record version and recalibration/re-saving. Erasing flash/NVS removes saved settings.
 
+## 8. Browser control and fallback AP
+
+1. Power on with the robot supported. **Boot remains off.** When no fresh valid ESP-NOW packets are arriving, connect a phone or computer to **`Hexapod-XXXXXX`** (suffix from the receiver STA MAC). The SSID and address are also printed on Serial.
+2. The AP is intentionally **open, with no password**, and allows one associated device at a time. Stay connected when your phone warns that there is no Internet. Open **http://192.168.4.1** manually; there is no captive-portal redirect.
+3. Use **Enable driving / home**, then hold the direction buttons, W/A/S/D, or arrow keys. You can combine forward/reverse with turning. Releasing controls returns toward home. **Stop / hold home** ends the driving session; **Outputs off** disables pulses and releases torque.
+4. The same page provides joint angles/pulses, the leg-by-leg servo sequence, calibration, parameter edits, settings save/load, initialization and the full command console. These use the same validation, off-mode restrictions, pulse limits and persistence rules as Serial. Read current settings while off before adjusting calibration; only **Save to flash** persists changes.
+
+The entire page is embedded in firmware: no external scripts, Internet, filesystem upload, or extra Arduino library is required. The server uses the ESP32 core's bundled `esp_http_server`. Do not expose this AP to untrusted users: **any nearby device can connect and control the robot**, including enabling outputs or changing calibration. A per-boot request token blocks ordinary cross-origin browser submissions; it is not user authentication or encryption.
+
+### Source priority and disconnect behavior
+
+- ESP-NOW is connectionless. A **fresh, correctly formatted packet**, not merely an initialized receiver, counts as an active signal. The AP and STA share `radio_channel`, so ESP-NOW reception continues while the AP is on. The transmitter must target the **STA MAC**, not the AP MAC.
+- Fresh ESP-NOW packets **switch off the AP and disconnect the browser in every mode**. During web driving they immediately clear browser motion, select radio control, and require centered sticks before radio movement. Boot/off, direct poses, home, timed serial walks, and servo sequences remain protected from automatic radio motion.
+- With no valid packet for `timeout_ms` (**500 ms default**), the AP returns. Radio motion stops through its existing watchdog. Reconnecting a browser never resumes its previous motion: explicitly enable web driving again. Invalid/stale packets do not suppress the AP. Network startup failures are logged and retried every five seconds.
+- Web driving sends a heartbeat every 50 ms. Missing valid heartbeats for **500 ms** ends web driving and returns toward home. Lost focus or a hidden/closed page also attempts to stop; the firmware watchdog covers delivery failure. Stale requests and commands from an earlier control session cannot restart movement. A second page can explicitly enable a new driving session, which invalidates the first.
+- The browser watchdog applies to **web driving**, not calibration poses, timed `walk` commands, or servo sequences. Those retain the console's normal hold/deadline/leg-pause behavior even if Wi-Fi disappears. ESP-NOW can therefore remove the AP while a servo test continues to its next pause. Keep Serial and a physical power disconnect available.
+- Serial `off`, `stop`, and I2C faults invalidate browser driving. Serial diagnostics/configuration remain available regardless of radio/AP state. `init` or a change to `radio_channel` can disconnect the browser; reconnect after initialization. Updating the channel requires Serial `init` if the AP has already gone away.
+
+Before putting the robot on the ground, bench-test a held browser direction followed by closing the page, powering on the transmitter with sticks off-center, then centering them, and switching the transmitter off. Verify stop/arming/AP recovery with the actual board, browser and RF environment; software tests cannot validate physical timing or mechanical clearance.
+
 ## Troubleshooting
 
 - **Missing PCA9685 / disabled outputs:** check VCC=3.3 V, shared ground, SDA/SCL, and A0 on board #2. Both drivers are required. Fix the fault and use `init`. `scan` may also show the PCA9685 all-call address 0x70; that is not a third board.
 - **No servo movement:** boot is intentionally off. Check `status`, external servo power and grounds, and the correct S/PWM pins; use a deliberate `servo`, `center`, `home` or `radio` command after calibration.
 - **Wrong leg/joint moves:** use the robot-perspective channel table; board #2 starts at **channel 7 with the left rear**, not left front.
-- **No remote control:** select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Radio packets are deliberately ignored for motion in all other modes.
+- **No remote control:** select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Automatic radio takeover is limited to active web driving; all other modes require explicitly selecting `radio`.
+- **No browser/AP:** a fresh ESP-NOW signal intentionally removes the AP. Turn the transmitter off and wait at least `timeout_ms`. Check Serial for network errors, connect to the printed open SSID, accept the no-Internet warning, and browse to http://192.168.4.1. Only one device may associate at a time. Pending channel changes require Serial `init`.
 - **Resets/jitter:** check servo current demand, power/ground routing, bulk capacitance, and short I2C wiring. Never join a 5 V pull-up to an ESP32 GPIO.
 - **I2C error during motion:** both OEs are driven high; motion stops but the console remains available. Loss of pulses may release servo torque, so the robot can collapse. Fix the fault, then `init`; output remains off until explicitly enabled. A software failsafe or OE is not a substitute for supporting the robot and a physical power disconnect.
 
@@ -373,6 +395,8 @@ if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-firmware.exe" }
 ```
 
 The integration test suppresses MSVC's double-to-float warnings for the Arduino gait math; the pure logic test uses all warnings as errors. Compilation and host tests cannot verify physical wiring, flash power-loss behavior, supply capacity, actual servo endpoints, RF reception or the gait on your assembled robot. Perform the supported bench checks above before walking.
+
+The firmware tests also exercise the HTTP handlers, request validation/token checks, command errors and calibration feedback, open-AP startup/channel sharing, valid/stale/invalid ESP-NOW priority, neutral-stick handoff, AP timeout/retry, browser heartbeat timeout and timer wraparound, stale-session rejection, slow requests, and serial/I2C interruption of browser driving.
 
 The flashing-workflow tests use a fake CLI, so no board is needed and nothing is uploaded:
 

@@ -14,7 +14,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #define constrain(value, low, high) ((value) < (low) ? (low) : ((value) > (high) ? (high) : (value)))
-constexpr int HIGH = 1, LOW = 0, OUTPUT = 1, WIFI_STA = 1, WIFI_AP_STA = 3;
+constexpr int HIGH = 1, LOW = 0, OUTPUT = 3, INPUT_PULLUP = 5, WIFI_STA = 1, WIFI_AP_STA = 3;
 constexpr int ESP_OK = 0, WIFI_PS_NONE = 0, WIFI_SECOND_CHAN_NONE = 0;
 constexpr int pdPASS = 1, pdTRUE = 1, pdFALSE = 0;
 constexpr int ESP_FAIL = -1;
@@ -26,12 +26,29 @@ namespace Fake
 {
 inline uint32_t now = 0;
 inline int outputEnable = HIGH;
+inline int oeMode = -1, oeLatch = LOW;
+inline unsigned unconfiguredGpioWrites = 0;
+inline std::vector<int> oeStartupLevels;
 inline bool boardsPresent = true, writeFailure = false, radioFailure = false;
 inline int writesUntilFailure = -1;
 inline bool storageFailure = false, readFailure = false;
 inline std::vector<uint8_t> saved;
 inline unsigned saves = 0;
 inline uint16_t pwm[2][16] = {};
+inline uint16_t pwmOn[2][16] = {};
+inline uint16_t pwmOff[2][16] = {};
+struct PwmWrite
+{
+  uint32_t atMs;
+  size_t board;
+  uint8_t channel;
+  uint16_t on, off;
+  int outputEnable;
+};
+inline std::vector<PwmWrite> pwmWrites;
+inline std::vector<int> radioOutputEnable;
+inline std::vector<unsigned> radioActiveChannels;
+inline std::vector<int> driverOutputEnable;
 inline uint8_t channel = 1;
 inline bool apStarted = false, apFailure = false, apStopFailure = false, httpFailure = false;
 inline int wifiMode = WIFI_STA;
@@ -42,8 +59,29 @@ inline uint32_t httpReceiveDelayMs = 0;
 
 inline uint32_t millis() { return Fake::now; }
 inline void delay(uint32_t ms) { Fake::now += ms; }
-inline void pinMode(int, int) {}
-inline void digitalWrite(int pin, int value) { if (pin == 23) Fake::outputEnable = value; }
+inline void pinMode(int pin, int mode)
+{
+  if (pin != 23)
+    return;
+  Fake::oeMode = mode;
+  Fake::outputEnable = mode == INPUT_PULLUP ? HIGH : Fake::oeLatch;
+  if (mode == OUTPUT)
+    Fake::oeStartupLevels.push_back(Fake::outputEnable);
+}
+inline void digitalWrite(int pin, int value)
+{
+  if (pin != 23)
+    return;
+  if (Fake::oeMode == -1)
+  {
+    ++Fake::unconfiguredGpioWrites;
+    return;
+  }
+  Fake::oeLatch = value;
+  if (Fake::oeMode == OUTPUT)
+    Fake::outputEnable = value;
+}
+inline int digitalRead(int) { return Fake::outputEnable; }
 
 class Print
 {
@@ -104,7 +142,18 @@ inline FakeWire Wire;
 
 struct FakeWiFi
 {
-  bool mode(int value) { Fake::wifiMode = value; return !Fake::radioFailure; }
+  bool mode(int value)
+  {
+    Fake::radioOutputEnable.push_back(Fake::outputEnable);
+    unsigned active = 0;
+    for (auto& board : Fake::pwm)
+      for (uint16_t ticks : board)
+        if (ticks != 4096)
+          ++active;
+    Fake::radioActiveChannels.push_back(active);
+    Fake::wifiMode = value;
+    return !Fake::radioFailure;
+  }
   std::string macAddress() const { return "00:11:22:33:44:55"; }
   bool softAP(const char* name, const char* password, int channel, int, int)
   {
@@ -179,17 +228,24 @@ class Adafruit_PWMServoDriver
   uint8_t prescale = 121;
 public:
   explicit Adafruit_PWMServoDriver(uint8_t address) : board(address - 0x40) {}
-  bool begin() { return Fake::boardsPresent; }
+  bool begin()
+  {
+    Fake::driverOutputEnable.push_back(Fake::outputEnable);
+    return Fake::boardsPresent;
+  }
   void setOscillatorFrequency(uint32_t value) { oscillator = value; }
   void setPWMFreq(float hz) { prescale = uint8_t(lroundf(float(oscillator) / (4096 * hz)) - 1); }
   uint8_t readPrescale() const { return prescale; }
-  int setPWM(uint8_t channel, uint16_t, uint16_t ticks)
+  int setPWM(uint8_t channel, uint16_t on, uint16_t off)
   {
     if (Fake::writeFailure || Fake::writesUntilFailure == 0)
       return 1;
     if (Fake::writesUntilFailure > 0)
       --Fake::writesUntilFailure;
-    Fake::pwm[board][channel] = ticks;
+    Fake::pwmOn[board][channel] = on;
+    Fake::pwmOff[board][channel] = off;
+    Fake::pwm[board][channel] = off == 4096 ? 4096 : uint16_t((off + 4096 - on) % 4096);
+    Fake::pwmWrites.push_back({Fake::now, board, channel, on, off, Fake::outputEnable});
     return 0;
   }
 };

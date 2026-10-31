@@ -79,6 +79,14 @@ Adafruit_PWMServoDriver pwm[DRIVER_COUNT] =
 };
 uint8_t pwmPrescale[DRIVER_COUNT] = {};
 uint16_t lastPulses[LEG_COUNT][JOINT_COUNT] = {};
+uint16_t targetPulses[LEG_COUNT][JOINT_COUNT] = {};
+constexpr size_t SERVO_COUNT = LEG_COUNT * JOINT_COUNT;
+constexpr uint32_t SERVO_STAGGER_MS = 250;
+constexpr uint32_t SERVO_WRITE_SPACING_MS = 1;
+bool posePending = false;
+size_t nextServo = 0;
+uint32_t lastServoWriteMs = 0;
+uint32_t servoWriteWaitMs = 0;
 QueueHandle_t controlQueue = nullptr;
 std::atomic<uint32_t> rejectedPackets{0};
 ControlState control;
@@ -127,7 +135,10 @@ void disable_outputs()
   webMotion = WebMotion{};
   control = ControlState{};
   servoTest = ServoTestState{};
+  posePending = false;
+  nextServo = 0;
   memset(lastPulses, 0, sizeof(lastPulses));
+  memset(targetPulses, 0, sizeof(targetPulses));
 }
 
 bool servo_error(const char* message)
@@ -240,22 +251,70 @@ bool write_pulse(size_t legIndex, size_t jointIndex, uint16_t pulseUs)
   const uint16_t ticks = pulseToTicks(pulseUs, settings.oscillatorHz(board), pwmPrescale[board]);
   if (ticks == 0 || ticks >= 4096)
     return servo_error("Servo pulse outside PCA9685 range.");
-  if (pwm[board].setPWM(channel, 0, ticks) != 0)
+  // Spread pulse edges over the frame, including across the two boards.
+  const uint16_t on = uint16_t((legIndex * JOINT_COUNT + jointIndex) * 4096 / SERVO_COUNT);
+  const uint16_t off = uint16_t((on + ticks) % 4096);
+  if (pwm[board].setPWM(channel, on, off) != 0)
   {
     console.printf("PCA9685 write failed: address 0x%02X, channel %u\n",
                   DRIVER_ADDRESSES[board], channel);
     return servo_error("I2C servo write failed.");
   }
   lastPulses[legIndex][jointIndex] = pulseUs;
+  lastServoWriteMs = millis();
   return true;
 }
 
-bool write_servo(size_t legIndex, size_t jointIndex, float angle)
+bool queue_pulse(size_t legIndex, size_t jointIndex, uint16_t pulseUs)
+{
+  if (!servosReady)
+  {
+    console.println("ERROR: servo drivers not ready; use init.");
+    return false;
+  }
+  targetPulses[legIndex][jointIndex] = pulseUs;
+  return true;
+}
+
+bool queue_servo(size_t legIndex, size_t jointIndex, float angle)
 {
   uint16_t pulseUs = 0;
   if (!servoPulse(angle, settings.servos[legIndex][jointIndex], pulseUs))
     return servo_error("Invalid servo angle or calibration.");
-  return write_pulse(legIndex, jointIndex, pulseUs);
+  return queue_pulse(legIndex, jointIndex, pulseUs);
+}
+
+void update_servo_outputs(uint32_t now)
+{
+  if (mode == Mode::Off || mode == Mode::ServoTest || mode == Mode::ServoTestPaused ||
+      uint32_t(now - lastServoWriteMs) < servoWriteWaitMs)
+    return;
+
+  for (size_t offset = 0; offset < SERVO_COUNT; ++offset)
+  {
+    const size_t index = (nextServo + offset) % SERVO_COUNT;
+    const size_t leg = index / JOINT_COUNT;
+    const size_t joint = index % JOINT_COUNT;
+    const uint16_t target = targetPulses[leg][joint];
+    if (target == 0 || target == lastPulses[leg][joint])
+      continue;
+    const bool stagger = posePending || mode == Mode::Pose || lastPulses[leg][joint] == 0;
+    if (!write_pulse(leg, joint, target))
+      return;
+    digitalWrite(SERVO_OE, LOW);
+    servoWriteWaitMs = stagger ? SERVO_STAGGER_MS : SERVO_WRITE_SPACING_MS;
+    nextServo = (index + 1) % SERVO_COUNT;
+    // Never catch up with a burst after a delayed loop.
+    return;
+  }
+  if (posePending)
+  {
+    posePending = false;
+    lastUpdateMs = now;
+    if (mode == Mode::Walk)
+      manualMotion.startedMs = now;
+    console.println("Staggered pose ready.");
+  }
 }
 
 bool clear_servo_outputs()
@@ -265,11 +324,14 @@ bool clear_servo_outputs()
       if (pwm[board].setPWM(channel, 0, 4096) != 0)
         return servo_error("Cannot clear PCA9685 outputs.");
   memset(lastPulses, 0, sizeof(lastPulses));
+  memset(targetPulses, 0, sizeof(targetPulses));
+  nextServo = 0;
   return true;
 }
 
 bool init_servos()
 {
+  disable_outputs();
   servosReady = false;
   if (!wireReady)
     wireReady = Wire.begin(I2C_SDA, I2C_SCL);
@@ -284,6 +346,9 @@ bool init_servos()
       console.printf("Missing PCA9685 at 0x%02X\n", DRIVER_ADDRESSES[board]);
       return servo_error("Check PCA9685 power, wiring and address jumpers.");
     }
+    for (uint8_t channel = 0; channel < 16; ++channel)
+      if (pwm[board].setPWM(channel, 0, 4096) != 0)
+        return servo_error("Cannot clear PCA9685 outputs.");
     pwm[board].setOscillatorFrequency(settings.oscillatorHz(board));
     pwm[board].setPWMFreq(settings.servoHz);
     pwmPrescale[board] = pwm[board].readPrescale();
@@ -292,8 +357,6 @@ bool init_servos()
     if (pwmPrescale[board] != expected)
       return servo_error("PCA9685 frequency configuration failed.");
   }
-  if (!clear_servo_outputs())
-    return false;
   servosReady = true;
   console.println("PCA9685 drivers ready; outputs remain disabled.");
   return true;
@@ -389,8 +452,9 @@ bool prepare_pose()
 void enable_pose()
 {
   mode = Mode::Pose;
-  digitalWrite(SERVO_OE, LOW);
-  console.println("Pose applied; ESP-NOW ignored. Other previously tested joints keep holding.");
+  posePending = true;
+  console.println("Pose queued: one joint every 250 ms; ESP-NOW ignored."
+                  " Other previously tested joints keep holding. stop cancels pending moves.");
 }
 
 void print_servo_test_step()
@@ -414,8 +478,10 @@ bool apply_servo_test_step()
 {
   const size_t leg = servoTest.servoIndex / JOINT_COUNT;
   const size_t joint = servoTest.servoIndex % JOINT_COUNT;
-  if (!write_servo(leg, joint, SERVO_TEST_ANGLES[servoTest.step]))
+  if (!queue_servo(leg, joint, SERVO_TEST_ANGLES[servoTest.step]) ||
+      !write_pulse(leg, joint, targetPulses[leg][joint]))
     return false;
+  servoWriteWaitMs = SERVO_STAGGER_MS;
   mode = Mode::ServoTest;
   digitalWrite(SERVO_OE, LOW);
   // Start a fresh hold after each write; delayed loops must not skip angles.
@@ -474,6 +540,7 @@ void update_servo_test(uint32_t now)
       return;
     }
     lastPulses[leg][joint] = 0;
+    targetPulses[leg][joint] = 0;
     if (joint + 1 == JOINT_COUNT)
     {
       mode = Mode::ServoTestPaused;
@@ -499,11 +566,14 @@ bool enter_home()
   if (mode == Mode::Off || mode == Mode::Pose || mode == Mode::ServoTest ||
       mode == Mode::ServoTestPaused)
   {
-    digitalWrite(SERVO_OE, HIGH);
+    if (mode == Mode::Off && !clear_servo_outputs())
+      return false;
     rebuild_geometry();
     if (!set_foot_positions(0, 0))
       return false;
-    digitalWrite(SERVO_OE, LOW);
+    posePending = true;
+    console.println("Home queued: one joint every 250 ms; driving waits until ready."
+                    " Support the body. stop cancels pending moves.");
   }
   control = ControlState{};
   webMotion = WebMotion{};
@@ -514,9 +584,10 @@ bool enter_home()
 void print_status()
 {
   console.printf("mode=%s OE=%s drivers=%s radio=%s unsaved=%s MAC=%s\n",
-      MODE_NAMES[size_t(mode)], mode == Mode::Off || mode == Mode::ServoTestPaused ? "HIGH" : "LOW",
+      MODE_NAMES[size_t(mode)], digitalRead(SERVO_OE) == HIGH ? "HIGH" : "LOW",
       servosReady ? "ready" : "init-needed", radioReady ? "ready" : "init-needed",
       settingsDirty ? "yes" : "no", WiFi.macAddress().c_str());
+  console.printf("pose-pending=%s (commanded targets, not position feedback)\n", posePending ? "yes" : "no");
   console.printf("armed=%u direction=%.2f rotation=%.2f configured-channel=%u AP=%s\n", control.armed,
       mode == Mode::Web ? webMotion.direction : (mode == Mode::Walk ? manualMotion.direction : control.direction),
       mode == Mode::Web ? webMotion.rotation : (mode == Mode::Walk ? manualMotion.rotation : control.rotation),
@@ -560,6 +631,7 @@ void print_help()
       "Open fallback AP: http://192.168.4.1. Fresh ESP-NOW disables AP and takes over web driving.\n"
       "next or Enter advances/finishes testservos; retest repeats the paused leg.\n"
       "stop cancels testservos holding the active joint or staying off if paused.\n"
+      "Poses/startup stagger joints by 250 ms; stop cancels pending moves; driving waits for home.\n"
       "Only save writes settings. Boot always stays off; !/off releases torque.");
 }
 
@@ -619,7 +691,13 @@ bool execute_command(const Command& command)
   }
   if (command.type == CommandType::Stop)
   {
-    if (mode == Mode::Radio || mode == Mode::Walk || mode == Mode::Web)
+    if (posePending)
+    {
+      memcpy(targetPulses, lastPulses, sizeof(targetPulses));
+      posePending = false;
+      mode = Mode::Pose;
+    }
+    else if (mode == Mode::Radio || mode == Mode::Walk || mode == Mode::Web)
       mode = Mode::Home;
     else if (mode == Mode::ServoTest)
     {
@@ -670,16 +748,18 @@ bool execute_command(const Command& command)
     {
       manualMotion = {command.values[0], command.values[1], millis(), command.durationMs};
       mode = Mode::Walk;
-      console.println("Timed walking test started; stop returns home, ! disables outputs.");
+      console.println("Timed walking test queued; duration starts when home is ready."
+                      " stop cancels startup/returns home, ! disables outputs.");
     }
     else if (command.type == CommandType::Web)
     {
       mode = Mode::Web;
       webMotion.receivedMs = millis();
-      console.println("Web driving enabled at home; hold a direction on the page. Link loss stops motion.");
+      console.println("Web driving selected; waits for home startup before moving."
+                      " Hold a direction on the page. Link loss stops motion.");
     }
     else
-      console.println("Home stance enabled; radio ignored.");
+      console.println("Home stance selected; radio ignored.");
     return true;
   }
   if (command.type == CommandType::Center || command.type == CommandType::Servo ||
@@ -727,24 +807,24 @@ bool execute_command(const Command& command)
       for (size_t leg = 0; leg < LEG_COUNT; ++leg)
         if (command.leg == LEG_COUNT || command.leg == leg)
           for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
-            if (!write_servo(leg, joint, 90))
+            if (!queue_servo(leg, joint, 90))
               return false;
     }
     else if (command.type == CommandType::Servo)
     {
-      if (!write_servo(command.leg, command.joint, command.values[0]))
+      if (!queue_servo(command.leg, command.joint, command.values[0]))
         return false;
     }
     else if (command.type == CommandType::Pulse)
     {
-      if (!write_pulse(command.leg, command.joint, uint16_t(command.values[0])))
+      if (!queue_pulse(command.leg, command.joint, uint16_t(command.values[0])))
         return false;
     }
     else
     {
       const float values[] = {angles.x, angles.y, angles.z};
       for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
-        if (!write_servo(command.leg, joint,
+        if (!queue_servo(command.leg, joint,
                          command.type == CommandType::Foot ? values[joint] : command.values[joint]))
           return false;
     }
@@ -762,8 +842,8 @@ bool execute_command(const Command& command)
     case CommandType::Save: return save_settings();
     case CommandType::Init:
     {
-      const bool radioOk = init_control();
       const bool servosOk = init_servos();
+      const bool radioOk = init_control();
       return radioOk && servosOk;
     }
     case CommandType::Scan:
@@ -924,6 +1004,21 @@ void update_network()
   apRetryPending = false;
 }
 
+void write_web_status(WebResponse& response)
+{
+  snprintf(response.body, sizeof(response.body),
+      "{\"mode\":\"%s\",\"generation\":%lu,\"token\":\"%s\",\"drivers\":%s,"
+      "\"radioReady\":%s,\"radio\":false,\"dirty\":%s,\"leg\":\"%s\",\"joint\":\"%s\","
+      "\"step\":%u,\"posePending\":%s,\"direction\":%.2f,\"rotation\":%.2f}",
+      MODE_NAMES[size_t(mode)], static_cast<unsigned long>(webGeneration), webTransport.token,
+      servosReady ? "true" : "false", radioReady ? "true" : "false",
+      settingsDirty ? "true" : "false", LEG_NAMES[servoTest.servoIndex / JOINT_COUNT],
+      JOINT_NAMES[servoTest.servoIndex % JOINT_COUNT], unsigned(servoTest.step),
+      posePending ? "true" : "false",
+      mode == Mode::Web ? webMotion.direction : control.direction,
+      mode == Mode::Web ? webMotion.rotation : control.rotation);
+}
+
 void process_web_request(WebRequest& request, WebResponse& response)
 {
   if (!apActive || !wifiReady || radio_active(millis()))
@@ -940,16 +1035,7 @@ void process_web_request(WebRequest& request, WebResponse& response)
   }
   if (request.type == WebRequestType::Status)
   {
-    snprintf(response.body, sizeof(response.body),
-        "{\"mode\":\"%s\",\"generation\":%lu,\"token\":\"%s\",\"drivers\":%s,"
-        "\"radioReady\":%s,\"radio\":false,\"dirty\":%s,\"leg\":\"%s\",\"joint\":\"%s\","
-        "\"step\":%u,\"direction\":%.2f,\"rotation\":%.2f}",
-        MODE_NAMES[size_t(mode)], static_cast<unsigned long>(webGeneration), webTransport.token,
-        servosReady ? "true" : "false", radioReady ? "true" : "false",
-        settingsDirty ? "true" : "false", LEG_NAMES[servoTest.servoIndex / JOINT_COUNT],
-        JOINT_NAMES[servoTest.servoIndex % JOINT_COUNT], unsigned(servoTest.step),
-        mode == Mode::Web ? webMotion.direction : control.direction,
-        mode == Mode::Web ? webMotion.rotation : control.rotation);
+    write_web_status(response);
     return;
   }
   uint32_t generation = 0;
@@ -995,7 +1081,10 @@ void process_web_request(WebRequest& request, WebResponse& response)
       console.println("ERROR: explicitly enable web driving first.");
     }
     else
+    {
       webMotion = {direction, rotation, millis()};
+      write_web_status(response);
+    }
     return;
   }
   if (!execute_command(command))
@@ -1027,6 +1116,9 @@ void read_web()
 
 void setup()
 {
+  // ESP32 requires GPIO registration before digitalWrite can preload the latch.
+  pinMode(SERVO_OE, INPUT_PULLUP);
+  digitalWrite(SERVO_OE, HIGH);
   pinMode(SERVO_OE, OUTPUT);
   disable_outputs();
   Serial.begin(115200);
@@ -1035,8 +1127,8 @@ void setup()
   if (!load_settings(settings))
     console.println("Using factory defaults in RAM; outputs remain disabled.");
   rebuild_geometry();
-  init_control();
   init_servos();
+  init_control();
   update_network();
   lastUpdateMs = millis();
 }
@@ -1052,7 +1144,7 @@ void loop()
     ++webGeneration;
     console.println("Web control timeout: returning home; explicitly enable web driving again.");
   }
-  if (mode == Mode::Walk && manualMotion.expired(millis()))
+  if (mode == Mode::Walk && !posePending && manualMotion.expired(millis()))
   {
     mode = Mode::Home;
     console.println("Walking test complete; returning home. Radio remains ignored.");
@@ -1061,7 +1153,7 @@ void loop()
   read_web();
   const uint32_t now = millis();
   update_servo_test(now);
-  if (uint32_t(now - lastUpdateMs) >= settings.updateMs)
+  if (!posePending && uint32_t(now - lastUpdateMs) >= settings.updateMs)
   {
     lastUpdateMs = now;
     if (mode == Mode::Web)
@@ -1073,6 +1165,7 @@ void loop()
     else if (mode == Mode::Home)
       set_foot_positions(0, 0);
   }
+  update_servo_outputs(millis());
   delay(1);
 }
 
@@ -1224,7 +1317,7 @@ bool set_foot_positions(float direction, float rotation)
 
     ax = constrain(ax, settings.coxaMin, settings.coxaMax);
 
-    if (!write_servo(i, 0, ax) || !write_servo(i, 1, ay) || !write_servo(i, 2, az))
+    if (!queue_servo(i, 0, ax) || !queue_servo(i, 1, ay) || !queue_servo(i, 2, az))
       return false;
   }
   return true;

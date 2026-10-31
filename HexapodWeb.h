@@ -185,7 +185,8 @@ class WebTransport
         snprintf(generation, sizeof(generation), "%lu", static_cast<unsigned long>(response.generation));
         httpd_resp_set_hdr(request, "X-Hexapod-Generation", generation);
         return reply(request, response.code, response.body,
-            message.type == WebRequestType::Status ? "application/json" : "text/plain; charset=utf-8");
+            response.code == 200 && message.type != WebRequestType::Command ?
+                "application/json" : "text/plain; charset=utf-8");
       }
     } while (uint32_t(millis() - started) < 2000);
     return reply(request, 504, "ERROR: controller did not respond; check status before retrying.");

@@ -40,7 +40,7 @@ Disconnect power before changing wiring or soldering jumpers. GPIO numbers below
 
 The chain is an electrically **parallel I2C bus**, not a serial data-output/data-input connection. Keep it short; the defaults are 400 kHz I2C and 50 Hz servo PWM. Breakout boards normally include SDA/SCL pull-ups to VCC. Ensure all pull-ups go to **3.3 V**, never 5 V.
 
-OE is active-low: GPIO23 LOW enables pulses; HIGH disables both boards. Add an **external 1 kOhm pull-up from the shared OE line to 3V3** so outputs stay disabled while the ESP32 resets. Many boards have 10 kOhm OE pull-downs; the 1 kOhm pull-up overcomes two of these. Check your board variant and confirm OE stays high during reset; remove conflicting pull-downs if needed. Do not tie OE to GND. On a detected initialization or servo-write fault, firmware drives OE high. The console remains available: fix the fault, then use `init` to retry without reflashing.
+OE is active-low: GPIO23 LOW enables pulses; HIGH disables both boards. Add an **external 1 kOhm pull-up from the shared OE line to 3V3** so outputs stay disabled while the ESP32 resets. Many boards have 10 kOhm OE pull-downs; the 1 kOhm pull-up overcomes two of these. Check your board variant and confirm OE stays high during reset; remove conflicting pull-downs if needed. Do not tie OE to GND. Boot and `init` hold OE high and clear both drivers before starting/restarting Wi-Fi/ESP-NOW; initialization never commands a pose. On a detected initialization or servo-write fault, firmware drives OE high. The console remains available: fix the fault, then use `init` to retry without reflashing.
 
 ### Wiring diagram
 
@@ -121,7 +121,7 @@ Channels **0-6 on board #1 (0x40)** and **9-15 on board #2 (0x41)** are unused a
 3. Install **Adafruit PWM Servo Driver Library** and its **Adafruit BusIO** dependency using Library Manager. WiFi, Wire, ESP-NOW, Preferences/NVS and FreeRTOS come with the ESP32 core. No Servo, ESP32Servo or RF24 library is needed.
 4. Open [Hexapod_Arduino.ino](Hexapod_Arduino.ino), keeping [HexapodControl.h](HexapodControl.h) and [HexapodConsole.h](HexapodConsole.h) beside it.
 5. Upload once; no source editing or reflashing is needed for normal calibration or parameter tuning.
-6. Upload with servo power off. Open Serial Monitor at **115200 baud**, select **Newline** or **Both NL & CR**, then reset. Boot loads saved settings if valid, initializes the drivers, and stays **off**. Type `help`. The receiver's **STA MAC address** is printed before PCA9685 initialization, so it can be read even with the drivers disconnected. Opening the serial port may reset some development boards; this also returns outputs to off.
+6. Upload with servo power off. Open Serial Monitor at **115200 baud**, select **Newline** or **Both NL & CR**, then reset. Boot loads saved settings if valid, initializes the drivers, and stays **off**. Type `help`. Radio initialization follows the PCA9685 initialization attempt, even if the drivers fail, so the receiver's **STA MAC address** can still be read with the drivers disconnected. Opening the serial port may reset some development boards; this also returns outputs to off.
 
 ### Flash and open the console from VS Code
 
@@ -231,6 +231,16 @@ MG996R travel and pulse limits vary, especially among clones. Do **not** assume 
 
 The gait assumes calibrated physical joint angles. A conservative 1000-2000 us range may produce less travel and is **not** a verified full-range calibration for your MG996Rs. If a servo cannot cover the required travel, adjust the mechanism/gait rather than forcing it against its stops. Nominal angles are clamped to 0-180 after reversal/trim. Gait coxa limits default to 45-135 degrees; direct `servo`/`joints` tests intentionally permit 0-180 for calibration.
 
+### Staggered output and power limits
+
+Serial and browser pose commands (`center`, `servo`, `pulse`, `joints`, `foot`) queue their targets rather than applying a batch at once. Changed joints are commanded **one every 250 ms**, retaining holding torque on previously enabled joints. Enabling `home`, `radio`, `walk` or browser driving from off/pose/servo-test mode uses the same staggered home transition. An eighteen-joint startup takes about **4.5 seconds**, including a final 250 ms settling interval; gait motion waits until it finishes. Support the body throughout this partial stance. Timed `walk` duration starts **after** startup, not when the command is received.
+
+The sequence is non-blocking: serial commands, HTTP responses, radio reception and link watchdogs continue while joints are being enabled. Serial `status` and the webpage report a pending pose. `stop` during a pending transition cancels remaining moves and holds only the joints already enabled; it does **not** finish the home stance. `off`/`!` and servo-write faults immediately disable OE and discard all pending targets. A browser timeout during startup clears driving commands and finishes only the home transition. These are commanded positions, not feedback that the servos have physically settled.
+
+During ordinary walking and return-home motion, the original tripod gait, target calculation cadence and smoothing remain, but hardware writes are round-robin, **at most one changed joint per millisecond**. A full eighteen-joint update therefore needs at least 18 ms; slow loops extend that interval and never catch up in a burst. Unchanged pulses are not rewritten. PWM rising edges are also phase-offset across the channels without changing pulse widths, including pulses that wrap past the end of the frame. The two PCA9685 oscillators are independent, so cross-board pulse alignment is not guaranteed. The already sequential `testservos` routine retains its one-second holds.
+
+Staggering reduces simultaneous starts; it does **not** cap current, prevent overlapping physical movement, or eliminate holding/stall current. Tripod walking still needs multiple supporting/moving joints. Keep the ESP32 power/ground isolated from servo return currents as described above, size the servo supply correctly, and measure rail dips under load. Software timing is not a substitute for proper power distribution or the OE pull-up.
+
 ### Automated one-servo-at-a-time test
 
 After manually checking each joint's neutral position and clearance, support the robot with its feet clear and keep the physical servo-power disconnect within reach. Send these commands individually:
@@ -246,7 +256,7 @@ After each leg's three joints finish, **all outputs are disabled and the sequenc
 
 The console reports each joint, board address, channel, nominal angle and commanded pulse width, then prompts for `retest`, `next` or Enter at each pause. `status` remains available and identifies the paused leg and disabled outputs. Each leg takes about **12 seconds** of motion; all six take about **72 seconds**, excluding pauses and retests. The sequence is non-blocking; delayed loop servicing extends holds rather than skipping movements. These are commanded positions, not measured feedback, and completion does not certify that a servo moved correctly.
 
-Send `off` or `!` to cancel and disable outputs, or `stop` to cancel while retaining the active joint's holding torque; if already paused, `stop` cancels and leaves outputs disabled. **Every leg pause and normal completion releases torque**, so keep the body supported throughout. Radio packets never interrupt or resume the sequence; `home`, `walk` or `radio` explicitly cancel it, even while paused, and enable all legs, which can move joints abruptly. Direct pose commands and configuration require cancelling the sequence first. An I2C fault disables outputs and requires `init` before restarting. The sequence does not change or save settings.
+Send `off` or `!` to cancel and disable outputs, or `stop` to cancel while retaining the active joint's holding torque; if already paused, `stop` cancels and leaves outputs disabled. **Every leg pause and normal completion releases torque**, so keep the body supported throughout. Radio packets never interrupt or resume the sequence; `home`, `walk` or `radio` explicitly cancel it, even while paused, and queue the staggered home transition described above. Direct pose commands and configuration require cancelling the sequence first. An I2C fault disables outputs and requires `init` before restarting. The sequence does not change or save settings.
 
 ## 7. Serial console reference
 
@@ -261,7 +271,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `params` | All named parameter ranges (while off) |
 | `show` | All current parameters, leg origins and eighteen calibrations, displayed as commands (while off) |
 | `off` / `!` | Disable both PCA9685 outputs immediately; radio cannot re-enable them |
-| `stop` | Stop radio/manual walking and return toward home; cancel a servo sequence holding the active joint, or stay disabled if paused; leave a direct pose or off state unchanged |
+| `stop` | Cancel pending pose/startup moves and hold already-enabled joints; otherwise stop walking and return toward home, cancel a servo sequence holding its active joint, or stay disabled if paused/off |
 | `center [all\|LEG]` | Hold nominal 90 degrees; default is all joints |
 | `servo LEG JOINT ANGLE` | Test one nominal angle, 0-180 degrees |
 | `pulse LEG JOINT US` | Test an integer pulse width within that servo's calibrated limits |
@@ -270,8 +280,8 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `next` / Enter on an empty line | At a servo-sequence pause, test the next leg, or finish with outputs disabled after the final leg |
 | `joints LEG COXA FEMUR TIBIA` | Set all three nominal angles of one leg |
 | `foot LEG DX DY DZ` | Test one foot via IK; offsets from that leg's home in body coordinates, each -150..150 mm; unreachable targets/joint angles are rejected |
-| `home` | Enable all legs at the home stance; ignore radio |
-| `walk DIRECTION ROTATION DURATION_MS` | Serial walking/turning test; each command axis -1..1; mandatory duration **100..10000 ms**, then return toward home |
+| `home` | Queue staggered home startup if needed; ignore radio |
+| `walk DIRECTION ROTATION DURATION_MS` | Serial walking/turning test; each command axis -1..1; mandatory duration **100..10000 ms** after home startup, then return toward home |
 | `radio` | Enable home stance, select radio, discard queued commands and require neutral sticks before arming |
 | `web` | Enable home stance and browser driving; requires the fallback AP and no fresh ESP-NOW signal |
 | `set NAME VALUE` | Change one named parameter in RAM (while off) |
@@ -365,7 +375,7 @@ The entire page is embedded in firmware: no external scripts, Internet, filesyst
 - ESP-NOW is connectionless. A **fresh, correctly formatted packet**, not merely an initialized receiver, counts as an active signal. The AP and STA share `radio_channel`, so ESP-NOW reception continues while the AP is on. The transmitter must target the **STA MAC**, not the AP MAC.
 - Fresh ESP-NOW packets **switch off the AP and disconnect the browser in every mode**. During web driving they immediately clear browser motion, select radio control, and require centered sticks before radio movement. Boot/off, direct poses, home, timed serial walks, and servo sequences remain protected from automatic radio motion.
 - With no valid packet for `timeout_ms` (**500 ms default**), the AP returns. Radio motion stops through its existing watchdog. Reconnecting a browser never resumes its previous motion: explicitly enable web driving again. Invalid/stale packets do not suppress the AP. Network startup failures are logged and retried every five seconds.
-- Web driving sends a heartbeat every 50 ms. Missing valid heartbeats for **500 ms** ends web driving and returns toward home. Lost focus or a hidden/closed page also attempts to stop; the firmware watchdog covers delivery failure. Stale requests and commands from an earlier control session cannot restart movement. A second page can explicitly enable a new driving session, which invalidates the first.
+- Web driving sends a neutral heartbeat immediately after enabling, then sends heartbeats every 50 ms with at most one in flight, including during home startup. Successful heartbeat replies include status; separate status polling pauses while driving so it cannot queue ahead of heartbeats on the single-task HTTP server. Missing valid heartbeats for **500 ms** ends web driving and returns toward home. Lost focus or a hidden/closed page also attempts to stop; the firmware watchdog covers delivery failure. Stale requests and commands from an earlier control session cannot restart movement. A second page can explicitly enable a new driving session, which invalidates the first.
 - The browser watchdog applies to **web driving**, not calibration poses, timed `walk` commands, or servo sequences. Those retain the console's normal hold/deadline/leg-pause behavior even if Wi-Fi disappears. ESP-NOW can therefore remove the AP while a servo test continues to its next pause. Keep Serial and a physical power disconnect available.
 - Serial `off`, `stop`, and I2C faults invalidate browser driving. Serial diagnostics/configuration remain available regardless of radio/AP state. `init` or a change to `radio_channel` can disconnect the browser; reconnect after initialization. Updating the channel requires Serial `init` if the AP has already gone away.
 
@@ -378,7 +388,9 @@ Before putting the robot on the ground, bench-test a held browser direction foll
 - **Wrong leg/joint moves:** use the robot-perspective channel table; board #2 starts at **channel 7 with the left rear**, not left front.
 - **No remote control:** select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Automatic radio takeover is limited to active web driving; all other modes require explicitly selecting `radio`.
 - **No browser/AP:** a fresh ESP-NOW signal intentionally removes the AP. Turn the transmitter off and wait at least `timeout_ms`. Check Serial for network errors, connect to the printed open SSID, accept the no-Internet warning, and browse to http://192.168.4.1. Only one device may associate at a time. Pending channel changes require Serial `init`.
+- **Web timeout immediately after enabling:** rebuild/upload the firmware and reload the ESP32 page so the browser uses the matching heartbeat/status protocol. Keep one control page in the foreground on the Hexapod AP. `Web control timeout` means no valid heartbeat reached the controller for 500 ms; a subsequent `control source changed` rejects that expired session, rather than indicating a servo startup error. Typing `web` in Serial alone does not start browser heartbeats; use the page's Enable button. Do not lengthen the watchdog to cover home startup.
 - **Resets/jitter:** check servo current demand, power/ground routing, bulk capacitance, and short I2C wiring. Never join a 5 V pull-up to an ESP32 GPIO.
+- **Brownout during Initialize drivers / radio:** `init` never enables servos. If they move during initialization, check both OE connections to GPIO23 and the external pull-up, including OE during reset. If resets persist with servo power disconnected, check the ESP32's own supply/USB cable/regulator under Wi-Fi load. Staggered motion cannot repair a supply or grounding fault.
 - **I2C error during motion:** both OEs are driven high; motion stops but the console remains available. Loss of pulses may release servo torque, so the robot can collapse. Fix the fault, then `init`; output remains off until explicitly enabled. A software failsafe or OE is not a substitute for supporting the robot and a physical power disconnect.
 
 ## Validation
@@ -396,7 +408,15 @@ if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-firmware.exe" }
 
 The integration test suppresses MSVC's double-to-float warnings for the Arduino gait math; the pure logic test uses all warnings as errors. Compilation and host tests cannot verify physical wiring, flash power-loss behavior, supply capacity, actual servo endpoints, RF reception or the gait on your assembled robot. Perform the supported bench checks above before walking.
 
-The firmware tests also exercise the HTTP handlers, request validation/token checks, command errors and calibration feedback, open-AP startup/channel sharing, valid/stale/invalid ESP-NOW priority, neutral-stick handoff, AP timeout/retry, browser heartbeat timeout and timer wraparound, stale-session rejection, slow requests, and serial/I2C interruption of browser driving.
+The firmware tests also exercise the HTTP handlers, request validation/token checks, command errors and calibration feedback, open-AP startup/channel sharing, valid/stale/invalid ESP-NOW priority, neutral-stick handoff, AP timeout/retry, browser heartbeat timeout and timer wraparound, stale-session rejection, slow requests, and serial/I2C interruption of browser driving. Timestamped PWM fakes verify the 250 ms pose/startup spacing, one-write-per-ms gait limit, no catch-up bursts, cancellation/fault cleanup, timed-walk startup gating, disabled outputs during web initialization, and phase-offset pulse widths (including frame wrap at 40/50/60 Hz).
+
+The embedded browser script can also be tested with Node.js, without packages or a connected board:
+
+```powershell
+node --test .\tests\test_web_page.js
+```
+
+[tests/test_web_page.js](tests/test_web_page.js) checks immediate neutral heartbeats, single-flight driving without competing status polls throughout startup, status updates from heartbeat replies, direction/release, stale-session rejection, connection loss, and leaving the page with a request in flight. Firmware tests check the matching JSON heartbeat responses and the unchanged 500 ms watchdog.
 
 The flashing-workflow tests use a fake CLI, so no board is needed and nothing is uploaded:
 

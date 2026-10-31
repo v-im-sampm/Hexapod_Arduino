@@ -11,13 +11,22 @@ void check(bool condition, const char* expression, int line)
 }
 #define CHECK(condition) check((condition), #condition, __LINE__)
 
-void send(const std::string& text, const std::string& ending = "\n")
+void finishPose()
+{
+  for (unsigned elapsed = 0; posePending && elapsed < 10000; ++elapsed)
+    loop();
+  CHECK(!posePending);
+}
+
+void send(const std::string& text, const std::string& ending = "\n", bool waitForPose = true)
 {
   Serial.output.clear();
   for (char character : text + ending)
     Serial.input.push_back(character);
   while (!Serial.input.empty())
     loop();
+  if (waitForPose)
+    finishPose();
 }
 
 void receive(const char* csv)
@@ -30,8 +39,16 @@ void testBootAndPoses()
 {
   setup();
   CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  CHECK(Fake::unconfiguredGpioWrites == 0);
+  CHECK(Fake::oeStartupLevels.size() == 1 && Fake::oeStartupLevels.front() == HIGH);
   CHECK(servosReady && radioReady && Fake::saves == 0);
   CHECK(apActive && Fake::apStarted && Fake::wifiMode == WIFI_AP_STA);
+  for (int oe : Fake::driverOutputEnable)
+    CHECK(oe == HIGH);
+  for (int oe : Fake::radioOutputEnable)
+    CHECK(oe == HIGH);
+  for (unsigned active : Fake::radioActiveChannels)
+    CHECK(active == 0);
   CHECK(Fake::apName == "Hexapod-334455" && Fake::channel == settings.radioChannel);
   for (auto& board : Fake::pwm)
     for (uint16_t ticks : board)
@@ -115,6 +132,8 @@ void testPersistence()
   settings = Settings{};
   settingsDirty = false;
   setup(); // Simulated reboot with the NVS bytes preserved.
+  for (int level : Fake::oeStartupLevels)
+    CHECK(level == HIGH);
   CHECK(settings.stepLength == 42 && mode == Mode::Off && Fake::outputEnable == HIGH);
   CHECK(settings.servos[0][0].reversed == 1);
   send("defaults");
@@ -536,6 +555,7 @@ void testMotionAndRecovery()
   CHECK(Fake::channel == 6 && radioReady);
   send("home");
   CHECK(mode == Mode::Home);
+  send("walk 1 0 1000");
   Fake::writeFailure = true;
   Fake::now += settings.updateMs;
   loop();
@@ -583,6 +603,17 @@ httpd_req_t webCommand(const std::string& command)
 httpd_req_t webDrive(const std::string& axes, uint32_t generation)
 {
   return http("/api/drive", std::to_string(generation) + "\n" + axes);
+}
+
+void finishWebPose()
+{
+  for (unsigned elapsed = 0; posePending && elapsed < 10000; ++elapsed)
+  {
+    if (elapsed % 50 == 0)
+      CHECK(webDrive("0 0", webGeneration).status == "200 OK");
+    loop();
+  }
+  CHECK(!posePending && mode == Mode::Web);
 }
 
 void prepareWebTest()
@@ -651,9 +682,21 @@ void testWebDrivingAndTimeout()
   prepareWebTest();
   CHECK(webDrive("1 0", webGeneration).status == "409 Conflict");
   CHECK(webCommand("web").status == "200 OK");
+  CHECK(posePending);
+  const auto pendingDrive = webDrive("0 0", webGeneration);
+  CHECK(pendingDrive.status == "200 OK" && pendingDrive.contentType == "application/json");
+  CHECK(pendingDrive.response.find("\"mode\":\"web\"") != std::string::npos);
+  CHECK(pendingDrive.response.find("\"posePending\":true") != std::string::npos);
+  CHECK(pendingDrive.response.find("\"direction\":0.00,\"rotation\":0.00") != std::string::npos);
+  CHECK(pendingDrive.response.find("\"generation\":" + std::to_string(webGeneration) + ",") != std::string::npos);
+  CHECK(pendingDrive.response.find(webTransport.token) != std::string::npos);
+  finishWebPose();
   CHECK(mode == Mode::Web && Fake::outputEnable == LOW);
   const uint32_t generation = webGeneration;
-  CHECK(webDrive("0.5 -0.5", generation).status == "200 OK");
+  const auto drive = webDrive("0.5 -0.5", generation);
+  CHECK(drive.status == "200 OK" && drive.contentType == "application/json");
+  CHECK(drive.response.find("\"posePending\":false") != std::string::npos);
+  CHECK(drive.response.find("\"direction\":0.50,\"rotation\":-0.50") != std::string::npos);
   CHECK(webMotion.direction == 0.5f && webMotion.rotation == -0.5f);
   const uint32_t received = webMotion.receivedMs;
   for (const char* axes : {"nan 0", "0 inf", "2 0", "0 -2", "1", "1 0 extra", "1 "})
@@ -664,7 +707,9 @@ void testWebDrivingAndTimeout()
   CHECK(mode == Mode::Web);
   loop();
   CHECK(mode == Mode::Home && webMotion.direction == 0 && webMotion.rotation == 0);
-  CHECK(webDrive("1 0", generation).status == "409 Conflict");
+  const auto expiredDrive = webDrive("1 0", generation);
+  CHECK(expiredDrive.status == "409 Conflict");
+  CHECK(expiredDrive.contentType == "text/plain; charset=utf-8");
   CHECK(mode == Mode::Home);
   CHECK(webCommand("web").status == "200 OK");
   const uint32_t restartedGeneration = webGeneration;
@@ -685,6 +730,7 @@ void testWebDrivingAndTimeout()
   loop();
   CHECK(mode == Mode::Home && webGeneration != wrappedGeneration);
   CHECK(webCommand("web").status == "200 OK");
+  finishWebPose();
   CHECK(webDrive("1 0", webGeneration).status == "200 OK");
   Fake::writeFailure = true;
   Fake::now += settings.updateMs;
@@ -801,6 +847,280 @@ void testWebNetworkFailures()
   send("init");
 }
 
+std::vector<Fake::PwmWrite> motionWrites()
+{
+  std::vector<Fake::PwmWrite> writes;
+  for (const auto& write : Fake::pwmWrites)
+    if (write.off != 4096)
+      writes.push_back(write);
+  return writes;
+}
+
+size_t activeServos()
+{
+  size_t count = 0;
+  for (const auto& leg : lastPulses)
+    for (uint16_t pulse : leg)
+      if (pulse != 0)
+        ++count;
+  return count;
+}
+
+void checkWriteSpacing(uint32_t minimumMs)
+{
+  const auto writes = motionWrites();
+  for (size_t i = 1; i < writes.size(); ++i)
+    CHECK(uint32_t(writes[i].atMs - writes[i - 1].atMs) >= minimumMs);
+}
+
+void checkPhasedPulses()
+{
+  for (size_t leg = 0; leg < LEG_COUNT; ++leg)
+    for (size_t joint = 0; joint < JOINT_COUNT; ++joint)
+    {
+      const size_t board = servoBoard(leg);
+      const uint8_t channel = servoChannel(leg, joint);
+      if (lastPulses[leg][joint] == 0)
+        CHECK(Fake::pwmOff[board][channel] == 4096);
+      else
+      {
+        const uint16_t expectedOn = uint16_t((leg * JOINT_COUNT + joint) * 4096 / 18);
+        const uint16_t ticks = pulseToTicks(lastPulses[leg][joint],
+                                            settings.oscillatorHz(board), pwmPrescale[board]);
+        CHECK(Fake::pwmOn[board][channel] == expectedOn);
+        CHECK(Fake::pwmOff[board][channel] == (expectedOn + ticks) % 4096);
+        CHECK(Fake::pwm[board][channel] == ticks);
+      }
+    }
+  for (uint8_t channel = 0; channel < 7; ++channel)
+    CHECK(Fake::pwmOff[0][channel] == 4096);
+  for (uint8_t channel = 9; channel < 16; ++channel)
+    CHECK(Fake::pwmOff[1][channel] == 4096);
+}
+
+void testStaggeredPoses()
+{
+  prepareWebTest();
+  const struct { const char* command; size_t count; Mode expected; } cases[] =
+  {
+    {"center all", 18, Mode::Pose}, {"center rm", 3, Mode::Pose},
+    {"servo rf coxa 95", 1, Mode::Pose}, {"pulse lf tibia 1600", 1, Mode::Pose},
+    {"joints rr 85 90 95", 3, Mode::Pose}, {"foot lr 0 0 0", 3, Mode::Pose},
+    {"home", 18, Mode::Home}, {"radio", 18, Mode::Radio}, {"walk 1 0 100", 18, Mode::Walk}
+  };
+  for (const auto& item : cases)
+  {
+    send("off");
+    Fake::now += 250;
+    Fake::pwmWrites.clear();
+    const uint32_t started = millis();
+    send(item.command, "\n", false);
+    CHECK(posePending && mode == item.expected && activeServos() == 1);
+    const float phase = gaitPhase;
+    for (unsigned elapsed = 0; posePending && elapsed < 10000; ++elapsed)
+    {
+      const size_t before = Fake::pwmWrites.size();
+      loop();
+      CHECK(Fake::pwmWrites.size() - before <= 1);
+      CHECK(gaitPhase == phase && mode == item.expected);
+    }
+    CHECK(!posePending && activeServos() == item.count);
+    CHECK(motionWrites().size() == item.count);
+    checkWriteSpacing(250);
+    CHECK(uint32_t(millis() - started) >= item.count * 250);
+    CHECK(uint32_t(millis() - started) <= item.count * 250 + 2);
+    CHECK(memcmp(targetPulses, lastPulses, sizeof(lastPulses)) == 0);
+    checkPhasedPulses();
+    if (mode == Mode::Walk)
+    {
+      CHECK(uint32_t(millis() - manualMotion.startedMs) <= 1);
+      Fake::now = manualMotion.startedMs + 99;
+      loop();
+      CHECK(mode == Mode::Walk);
+      loop();
+      CHECK(mode == Mode::Home);
+    }
+  }
+  send("off");
+}
+
+void testPendingPoseCancellationAndTiming()
+{
+  prepareWebTest();
+  Fake::now += 250;
+  Fake::pwmWrites.clear();
+  send("center all", "\n", false);
+  CHECK(activeServos() == 1);
+  const uint32_t first = motionWrites().front().atMs;
+  send("joints rf 80 85 95", "\n", false);
+  CHECK(motionWrites().size() == 1 && posePending);
+  Fake::now = first + 249;
+  loop();
+  CHECK(motionWrites().size() == 1);
+  loop();
+  CHECK(motionWrites().size() == 2);
+  CHECK(lastPulses[0][1] == 1472);
+  send("stop", "\n", false);
+  CHECK(mode == Mode::Pose && !posePending && activeServos() == 2);
+  CHECK(Fake::outputEnable == LOW);
+  const size_t stopped = Fake::pwmWrites.size();
+  Fake::now += 10000;
+  loop();
+  CHECK(Fake::pwmWrites.size() == stopped && activeServos() == 2);
+
+  send("home", "\n", false);
+  CHECK(posePending && activeServos() <= 3);
+  send("!", "\n", false);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !posePending);
+  const size_t disabled = Fake::pwmWrites.size();
+  Fake::now += 10000;
+  loop();
+  CHECK(Fake::pwmWrites.size() == disabled && activeServos() == 0);
+  send("servo lf tibia 90");
+  CHECK(activeServos() == 1);
+  checkPhasedPulses();
+  send("off");
+
+  Fake::now = UINT32_MAX - 100;
+  Fake::pwmWrites.clear();
+  send("center all", "\n", false);
+  const uint32_t wrappedStart = motionWrites().front().atMs;
+  Fake::now = wrappedStart + 249;
+  loop();
+  CHECK(motionWrites().size() == 1);
+  loop();
+  CHECK(motionWrites().size() == 2 && millis() < 1000);
+  Fake::now += 10000;
+  loop();
+  CHECK(motionWrites().size() == 3);
+  loop();
+  CHECK(motionWrites().size() == 3);
+  finishPose();
+  CHECK(motionWrites().size() == 18);
+  checkWriteSpacing(250);
+  send("off");
+
+  Fake::now += 250;
+  send("walk 1 0 100", "\n", false);
+  CHECK(mode == Mode::Walk && posePending);
+  send("stop", "\n", false);
+  CHECK(mode == Mode::Pose && !posePending && activeServos() == 1);
+  Fake::now += 10000;
+  loop();
+  CHECK(mode == Mode::Pose && activeServos() == 1);
+  send("off");
+
+  Fake::now += 250;
+  send("center all", "\n", false);
+  Fake::writesUntilFailure = 1;
+  Fake::now += 250;
+  loop();
+  CHECK(posePending && activeServos() == 2);
+  Fake::now += 250;
+  loop();
+  CHECK(!posePending && mode == Mode::Off && !servosReady && Fake::outputEnable == HIGH);
+  CHECK(Serial.output.find("I2C servo write failed") != std::string::npos);
+  CHECK(activeServos() == 0);
+  for (const auto& leg : targetPulses)
+    for (uint16_t pulse : leg)
+      CHECK(pulse == 0);
+  Fake::writesUntilFailure = -1;
+  send("init");
+  Fake::now += 10000;
+  loop();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+}
+
+void testStaggeredGaitAndPwm()
+{
+  prepareWebTest();
+  for (unsigned hz : {40, 50, 60})
+  {
+    send("set servo_hz " + std::to_string(hz));
+    send("init");
+    send("home");
+    Fake::pwmWrites.clear();
+    send("walk 1 -0.5 10000");
+    for (unsigned elapsed = 0; elapsed < 1000; ++elapsed)
+    {
+      const size_t before = Fake::pwmWrites.size();
+      loop();
+      CHECK(Fake::pwmWrites.size() - before <= 1);
+    }
+    CHECK(motionWrites().size() > 100);
+    checkWriteSpacing(1);
+    checkPhasedPulses();
+    send("stop");
+    for (unsigned elapsed = 0; elapsed < 1000; ++elapsed)
+      loop();
+    CHECK(mode == Mode::Home);
+    checkWriteSpacing(1);
+    checkPhasedPulses();
+    const size_t held = Fake::pwmWrites.size();
+    for (unsigned elapsed = 0; elapsed < 100; ++elapsed)
+      loop();
+    CHECK(Fake::pwmWrites.size() == held);
+    send("off");
+    send("cal lf tibia 500 2500 0 0");
+    send("pulse lf tibia 2500");
+    checkPhasedPulses();
+    CHECK(Fake::pwmOff[1][8] < Fake::pwmOn[1][8]);
+    send("off");
+  }
+  send("defaults");
+  send("init");
+}
+
+void testWebStaggeringAndInitialization()
+{
+  prepareWebTest();
+  Fake::now += 250;
+  const uint32_t started = millis();
+  CHECK(webCommand("center all").status == "200 OK");
+  CHECK(uint32_t(millis() - started) < 10);
+  CHECK(posePending && activeServos() == 1);
+  CHECK(http("/api/status").response.find("\"posePending\":true") != std::string::npos);
+  CHECK(webCommand("stop").status == "200 OK");
+  CHECK(mode == Mode::Pose && !posePending && activeServos() == 1);
+  CHECK(webCommand("off").status == "200 OK");
+  Fake::pwmWrites.clear();
+  Fake::driverOutputEnable.clear();
+  Fake::radioOutputEnable.clear();
+  Fake::radioActiveChannels.clear();
+  CHECK(webCommand("init").status == "200 OK");
+  CHECK(mode == Mode::Off && servosReady && radioReady && Fake::outputEnable == HIGH);
+  CHECK(motionWrites().empty());
+  CHECK(Fake::driverOutputEnable.size() == 2 && !Fake::radioOutputEnable.empty());
+  for (int oe : Fake::driverOutputEnable)
+    CHECK(oe == HIGH);
+  for (int oe : Fake::radioOutputEnable)
+    CHECK(oe == HIGH);
+  for (unsigned active : Fake::radioActiveChannels)
+    CHECK(active == 0);
+  for (const auto& write : Fake::pwmWrites)
+    CHECK(write.outputEnable == HIGH && write.off == 4096);
+  loop();
+  Fake::now += 250;
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(posePending && activeServos() == 1);
+  CHECK(webDrive("1 1", webGeneration).status == "200 OK");
+  const float phase = gaitPhase;
+  Fake::now = webMotion.receivedMs + 500;
+  loop();
+  CHECK(mode == Mode::Home && posePending && gaitPhase == phase);
+  CHECK(webMotion.direction == 0 && webMotion.rotation == 0);
+  finishPose();
+  CHECK(mode == Mode::Home && activeServos() == 18 && gaitPhase == phase);
+  CHECK(http("/api/status").response.find("\"posePending\":false") != std::string::npos);
+  CHECK(webCommand("off").status == "200 OK");
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(posePending);
+  CHECK(webCommand("off").status == "200 OK");
+  Fake::now += 10000;
+  loop();
+  CHECK(mode == Mode::Off && !posePending && activeServos() == 0 && Fake::outputEnable == HIGH);
+}
+
 int main()
 {
   testBootAndPoses();
@@ -815,5 +1135,9 @@ int main()
   testWebDrivingAndTimeout();
   testWebRadioPriority();
   testWebNetworkFailures();
-  puts("PASS: firmware console, servo tests, NVS, motion, web API, AP fallback, ESP-NOW priority and watchdog/fault recovery.");
+  testStaggeredPoses();
+  testPendingPoseCancellationAndTiming();
+  testStaggeredGaitAndPwm();
+  testWebStaggeringAndInitialization();
+  puts("PASS: firmware console, staggered poses/gait/PWM, servo tests, NVS, web API, AP fallback, ESP-NOW priority and watchdog/fault recovery.");
 }

@@ -42,7 +42,9 @@ Outputs off releases torque. These buttons are not a hardware emergency stop.</p
 <button data-command="stop">Stop / hold home</button>
 <button class="danger" data-command="off">Outputs off</button></div>
 <small>ESP-NOW takes priority and disconnects this AP. After a disconnect, reconnect to the AP and
-explicitly enable driving again. Boot never enables outputs.</small>
+explicitly enable driving again. Boot and initialization never enable outputs.
+Home/startup moves one joint every 250 ms (about 4.5 seconds for all joints); support the body.
+Driving waits until ready. Stop cancels pending startup moves and holds only the joints already enabled.</small>
 </section>
 <div class="grid">
 <section><h2>Drive</h2>
@@ -77,7 +79,8 @@ power disconnect if ESP-NOW removes the AP.</small>
 <form id="pulse-form"><div class="row"><label>Pulse (microseconds)<input id="pulse" type="number" min="500" max="2500" step="1" value="1500" required></label>
 <button>Set pulse</button></div></form>
 <div class="row"><button id="center-leg">Center this leg</button><button data-command="center all">Center all</button></div>
-<small>Requires off or pose mode. Check clearance before moving. Previously positioned joints keep holding.</small>
+<small>Requires off or pose mode. Moves are queued one joint every 250 ms; Stop cancels pending moves.
+Check clearance before moving. Previously positioned joints keep holding.</small>
 </section>
 <section><h2>Calibration</h2>
 <p>Uses the leg and joint selected under Joint positioning. Outputs must be off.</p>
@@ -174,8 +177,30 @@ async function command(text) {
   } catch (error) {
     if (ownVersion === version) disconnected(error);
   } finally {
-    if (ownVersion === version) { commandBusy = false; pollStatus(); }
+    if (ownVersion === version) {
+      commandBusy = false;
+      if (enabled) heartbeat();
+      else pollStatus();
+    }
   }
+}
+function updateStatus(text) {
+  const state = JSON.parse(text);
+  token = state.token;
+  generation = state.generation;
+  online = true;
+  if (enabled && (state.mode !== 'web' || generation !== driveGeneration)) localStop();
+  $('status').textContent = 'Connected | Mode: ' + state.mode + (enabled ? ' | Driving enabled' : '');
+  $('details').textContent = (state.drivers ? 'Drivers ready' : 'Drivers need init') +
+    ' | ' + (state.dirty ? 'Unsaved changes' : 'Settings saved/default') +
+    (state.radioReady ? ' | Listening for ESP-NOW' : ' | ESP-NOW needs init') +
+    (state.posePending ? ' | Moving joints in sequence - please wait' : '');
+  $('enable').disabled = !state.drivers;
+  $('next').disabled = $('retest').disabled = state.mode !== 'testservos-paused';
+  $('sequence').textContent = state.mode.startsWith('testservos') ?
+    state.leg.toUpperCase() + ' / ' + state.joint + ' / ' +
+    (state.mode === 'testservos-paused' ? 'Paused - Next or Retest' : 'Step ' + (state.step + 1)) :
+    'No servo test running.';
 }
 async function heartbeat() {
   if (!enabled || driveBusy || commandBusy || document.hidden) return;
@@ -192,32 +217,20 @@ async function heartbeat() {
       localStop();
       log(result.text || 'Control source changed. Explicitly enable driving again.');
     }
+    else updateStatus(result.text);
   } catch (error) { if (ownVersion === version) disconnected(error); }
   finally { driveBusy = false; }
 }
 async function pollStatus() {
-  if (statusBusy || commandBusy || document.hidden) return;
+  // The HTTP server is serial: driving replies carry status so polls cannot delay heartbeats.
+  if (enabled || driveBusy || statusBusy || commandBusy || document.hidden) return;
   statusBusy = true;
   const ownVersion = version;
   try {
     const result = await request('/api/status');
     if (ownVersion !== version) return;
     if (!result.ok) throw new Error(result.text);
-    const state = JSON.parse(result.text);
-    token = state.token;
-    generation = state.generation;
-    online = true;
-    if (enabled && (state.mode !== 'web' || generation !== driveGeneration)) localStop();
-    $('status').textContent = 'Connected | Mode: ' + state.mode + (enabled ? ' | Driving enabled' : '');
-    $('details').textContent = (state.drivers ? 'Drivers ready' : 'Drivers need init') +
-      ' | ' + (state.dirty ? 'Unsaved changes' : 'Settings saved/default') +
-      (state.radioReady ? ' | Listening for ESP-NOW' : ' | ESP-NOW needs init');
-    $('enable').disabled = !state.drivers;
-    $('next').disabled = $('retest').disabled = state.mode !== 'testservos-paused';
-    $('sequence').textContent = state.mode.startsWith('testservos') ?
-      state.leg.toUpperCase() + ' / ' + state.joint + ' / ' +
-      (state.mode === 'testservos-paused' ? 'Paused - Next or Retest' : 'Step ' + (state.step + 1)) :
-      'No servo test running.';
+    updateStatus(result.text);
   } catch (error) {
     if (ownVersion === version && (online || $('status').textContent === 'Connecting...'))
       disconnected(error);

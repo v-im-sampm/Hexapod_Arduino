@@ -10,9 +10,14 @@ Firmware for the [original printed hexapod](https://makerworld.com/en/models/197
 
 The original leg geometry, inverse kinematics, alternating-tripod gait, step dimensions and smoothing are the defaults. All motion/calibration parameters can be adjusted over the serial console or the ESP32-hosted webpage and explicitly saved to ESP32 flash. An open fallback Wi-Fi AP provides browser control whenever no fresh ESP-NOW signal is present. Direct GPIO servo output, Mega pin assignments, SPI/nRF24L01 control and unused forward-kinematics intermediates have been removed. The ESP32's built-in radio replaces the nRF24L01; no separate radio module is connected.
 
+**Opt-in motion:** `gait tripod`, `gait tetrapod`, and `gait ripple` add proportional walking,
+strafing, combined translation/turning, smooth swing/landing, and live tuning. `gait legacy`
+retains the original motion and remains the factory and migrated-settings default. See
+[Improved gaits](#improved-gaits). No Dynamixel, display, or donor-controller libraries are needed.
+
 ## 1. Power first
 
-**Support the robot with its feet clear of the bench during setup. Boot always leaves outputs disabled; serial commands explicitly enable them. Disabling outputs can release torque and collapse the robot. Keep a physical servo-power disconnect within reach.**
+**Support the robot with its feet clear of the bench during setup. Boot always leaves outputs disabled; serial/web commands or a 1-second hold of the remote's K1 button explicitly enable them. Disabling outputs can release torque and collapse the robot. Keep a physical servo-power disconnect within reach.**
 
 - Use a regulated **5-6 V** servo supply; 6 V is a suitable nominal choice. Never connect a 2S LiPo directly to the servos. Use a suitably rated regulator/BEC.
 - Size the supply, distribution wiring, connectors and fuses for the actual load. [TowerPro's MG996R specification](https://towerpro.com.tw/product/mg996r/) lists 1.4 A stall current: eighteen servos could demand **25.2 A**. A 6 V / 30 A supply is a starting point for those specifications, not a guarantee for clones or a loaded robot. Measure your units; some variants draw substantially more. Avoid prolonged stalls.
@@ -191,7 +196,7 @@ The default protocol matches [tx.py](espnow/tx/tx.py) and [rxbulldozer.py](espno
 1. Copy the printed **receiver STA MAC** into the desired `receiver1_mac`, `receiver2_mac` or `receiver3_mac` entry in [tx.py](espnow/tx/tx.py). For a single robot, set all three to that same MAC; otherwise L1 selects which model receives commands.
 2. For example, a receiver MAC of `24:6f:28:12:34:56` becomes `b'\x24\x6f\x28\x12\x34\x56'`. Use your actual address, not this example.
 3. On the **CyberBrick transmitter**, copy [boot.py](espnow/tx/boot.py), [main.py](espnow/tx/main.py) and your configured [tx.py](espnow/tx/tx.py). Keep the empty boot script; the main script starts the transmitter. Reset it.
-4. After calibration, send `radio` from the serial console to enable the home stance and select ESP-NOW control. Center the left vertical and right horizontal sticks. Serial Monitor reports `ESP-NOW control armed.` before walking commands are accepted. `status` shows the latest valid received CSV packet and its age, even while outputs are off.
+4. After calibration, either hold the remote's **K1 button for 1 second** (see [Remote-only operation](#remote-only-operation)) or send `radio` from the serial console to enable the home stance and select ESP-NOW control. Center the left vertical and right horizontal sticks. Serial Monitor reports `ESP-NOW control armed.` before walking commands are accepted. `status` shows the latest valid received CSV packet and its age, even while outputs are off.
 
 The payload is ASCII/UTF-8 CSV, **not a binary array of integers**, with no trailing newline or NUL:
 
@@ -203,18 +208,37 @@ L1,L2,L3,R1,R2,R3,K1,K2,K3,K4
 | Zero-based field | Input | Accepted range | Hexapod use |
 |---:|---|---|---|
 | 0 | L1 / model switch | 0-4095 | Transmitter selects receiver; ignored here |
-| 1 | L2 / left horizontal | 0-4095 | Unused |
+| 1 | L2 / left horizontal | 0-4095 | Strafe left/right with improved gaits; unused in legacy |
 | 2 | L3 / left vertical | 0-4095 | Walk forward/backward |
 | 3 | R1 / slider | 0-4095 | Unused |
 | 4 | R2 / right horizontal | 0-4095 | Turn left/right |
 | 5 | R3 / right vertical | 0-4095 | Unused |
-| 6-9 | K1-K4 / buttons | 0 or 1 (active-low) | Unused |
+| 6 | K1 / button | 0 or 1 (active-low) | Hold 1 s: stand up in radio mode / disable outputs |
+| 7-9 | K2-K4 / buttons | 0 or 1 (active-low) | Unused |
 
 By default, both used sticks have a neutral interval of **1947-2147 inclusive** (2047 +/- 100, as in the bulldozer receiver). Throttle below 1947 means forward; above 2147 means reverse. Steering below 1947 requests positive rotation/left; above 2147 requests negative rotation/right. Use `set throttle_reverse 1` or `set steering_reverse 1` while off if the physical direction differs. Walking and turning may be combined; radio control remains discrete rather than proportional, with configurable stride and timing.
 
-Exactly ten unsigned decimal fields are validated: up to four digits per analog field and one per button, at most 37 bytes total. Malformed packets are counted/reported and do not refresh the watchdog. Other channels are validated but have no motion effect; buttons are **not** emergency stops.
+That discrete behavior applies to **legacy**. Improved gaits map each stick continuously from
+the edge of the deadzone to full deflection. L2 below the deadzone requests left strafe
+(+Y); `set strafe_reverse 1` reverses it. Forward, strafe, and turn must **all** be neutral
+to arm improved motion. Changing between legacy and improved radio control requires
+neutral-stick re-arming; changing between improved gaits does not. Select/save a gait
+before using the remote, or change it through Serial; K2-K4 remain unused.
 
-In radio mode, after **500 ms without a valid packet** by default (`timeout_ms`), motion commands become zero and the feet smoothly return toward their home stance. Servos remain powered and holding; this is not an emergency power cutoff. Entering radio mode and signal recovery require neutral sticks before motion is enabled again. Selecting another model therefore also stops this robot after the timeout. Radio loss does not reboot ESP-NOW. Radio packets never enable outputs at boot or override serial tests; use `radio` explicitly to hand control back.
+Exactly ten unsigned decimal fields are validated: up to four digits per analog field and one per button, at most 37 bytes total. Malformed packets are counted/reported and do not refresh the watchdog. Unassigned channels are validated but have no motion effect. K1 is a deliberate 1-second hold, not an instant emergency stop; keep the physical power disconnect within reach.
+
+In radio mode, after **500 ms without a valid packet** by default (`timeout_ms`), motion commands become zero and the feet smoothly return toward their home stance. Servos remain powered and holding; this is not an emergency power cutoff. Entering radio mode and signal recovery require neutral sticks before motion is enabled again. Selecting another model therefore also stops this robot after the timeout. Radio loss does not reboot ESP-NOW. Stick packets never enable outputs at boot or override serial tests; only an explicit K1 hold (from off) or `radio` hands control to the remote.
+
+### Remote-only operation
+
+The robot can be run from power-on to power-off with only the CyberBrick remote; no serial console or browser is needed once it is calibrated and the settings are saved.
+
+1. Support the robot and power it on. Boot always leaves outputs **off**. Switch on the remote (with L1 selecting this robot).
+2. **Hold K1 for 1 second.** The robot stands up into its home stance one joint every 250 ms (about 4.5 s) and selects radio control. If the PCA9685 drivers were not ready (for example, servo/driver power came up after the ESP32), the hold retries driver initialization first; outputs stay off if it still fails.
+3. Center the sticks to arm, then walk with the left vertical stick and turn with the right horizontal stick.
+4. **Hold K1 for 1 second** again to disable all outputs. **Torque is released and the body drops to the ground**, so stop on a flat surface (or support the body) first. It is then safe to switch off servo power, the ESP32 and the remote.
+
+The hold must start after the button is seen released over a live link. A button already held when the link appears, a hold interrupted by signal loss (`timeout_ms`), or a short tap is ignored, and each hold toggles only once. From any active mode (radio, home, web, poses, timed walks or servo tests), a K1 hold disables outputs exactly like `off`. Status messages beginning `Remote button:` are printed on Serial when connected.
 
 Like the supplied examples, this receiver accepts valid packets from any sender that addresses it on the correct channel; it does not authenticate or encrypt commands. Use it in a controlled environment.
 
@@ -239,7 +263,14 @@ Serial and browser pose commands (`center`, `servo`, `pulse`, `joints`, `foot`) 
 
 The sequence is non-blocking: serial commands, HTTP responses, radio reception and link watchdogs continue while joints are being enabled. Serial `status` and the webpage report a pending pose. `stop` during a pending transition cancels remaining moves and holds only the joints already enabled; it does **not** finish the home stance. `off`/`!` and servo-write faults immediately disable OE and discard all pending targets. A browser timeout during startup clears driving commands and finishes only the home transition. These are commanded positions, not feedback that the servos have physically settled.
 
-During ordinary walking and return-home motion, the original tripod gait, target calculation cadence and smoothing remain. **All changed joints in a gait frame are written in the same loop iteration**, before another target is calculated. The former one-joint-per-ms scheduler needed at least 18 ms for a full update, longer than the default 10 ms target interval; joints could therefore receive targets from different gait frames, with loop delays making the skew worse. Active gait frames no longer have that artificial write spacing. I2C writes are still sequential, not electrically simultaneous; unchanged pulses are not rewritten, and a delayed loop produces only one new frame rather than replaying missed frames. The 250 ms pose/startup spacing is unchanged. PWM rising edges are also phase-offset across the channels without changing pulse widths, including pulses that wrap past the end of the frame. The two PCA9685 oscillators are independent, so cross-board pulse alignment is not guaranteed. The already sequential `testservos` routine retains its one-second holds.
+In legacy mode, the original tripod target cadence and smoothing remain. All gaits use
+the same output scheduler: **all changed joints in a gait frame are written in the same
+loop iteration**, before another target is calculated. I2C writes are sequential, not
+electrically simultaneous; unchanged pulses are not rewritten, and delayed loops do
+not replay missed frames. The 250 ms pose/startup spacing is unchanged. PWM rising edges
+are phase-offset without changing pulse widths, including pulses that wrap around a
+frame. The PCA9685 oscillators are independent, so cross-board alignment is not
+guaranteed. `testservos` retains its one-second holds.
 
 Staggering reduces simultaneous starts; it does **not** cap current, prevent overlapping physical movement, or eliminate holding/stall current. Tripod walking still needs multiple supporting/moving joints. Keep the ESP32 power/ground isolated from servo return currents as described above, size the servo supply correctly, and measure rail dips under load. Software timing is not a substitute for proper power distribution or the OE pull-up.
 
@@ -272,7 +303,7 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `status` | Mode, OE, driver/radio readiness, unsaved changes, MAC, latest RX values/age; while off/posing/testing servos, commanded pulses and current sequence step or paused leg (not position feedback) |
 | `params` | All named parameter ranges (while off) |
 | `show` | All current parameters, leg origins and eighteen calibrations, displayed as commands (while off) |
-| `off` / `!` | Disable both PCA9685 outputs immediately; radio cannot re-enable them |
+| `off` / `!` | Disable both PCA9685 outputs immediately; stick packets cannot re-enable them (only a deliberate K1 hold can) |
 | `stop` | Cancel pending pose/startup moves and hold already-enabled joints; otherwise stop walking and return toward home, cancel a servo sequence holding its active joint, or stay disabled if paused/off |
 | `center [all\|LEG]` | Hold nominal 90 degrees; default is all joints |
 | `servo LEG JOINT ANGLE` | Test one nominal angle, 0-180 degrees |
@@ -284,6 +315,9 @@ Commands are case-insensitive, space/tab separated, and terminated by LF, CR or 
 | `foot LEG DX DY DZ` | Test one foot via IK; offsets from that leg's home in body coordinates, each -150..150 mm; unreachable targets/joint angles are rejected |
 | `home` | Queue staggered home startup if needed; ignore radio |
 | `walk DIRECTION ROTATION DURATION_MS` | Serial walking/turning test; each command axis -1..1; mandatory duration **100..10000 ms** after home startup, then return toward home |
+| `move FORWARD STRAFE TURN DURATION_MS` | Three-axis timed test; same limits/deadline as `walk`; nonzero strafe requires an improved gait |
+| `gait legacy\|tripod\|tetrapod\|ripple` | Select in RAM without enabling outputs; active motion settles before switching; rejected during startup or direct servo tests |
+| `tune NAME VALUE` | Live improved-gait tuning for `motion_stride`, `motion_lift`, `motion_turn`, `motion_cycle_ms`, or `home_z`; also accepted while off |
 | `radio` | Enable home stance, select radio, discard queued commands and require neutral sticks before arming |
 | `web` | Enable home stance and browser driving; requires the fallback AP and no fresh ESP-NOW signal |
 | `set NAME VALUE` | Change one named parameter in RAM (while off) |
@@ -325,12 +359,93 @@ Lengths/origins/height are in mm; angular parameters are degrees.
 | `stick_deadzone` | 100 | 1..1024, integer; center +/- deadzone must fit 0..4095 |
 | `throttle_channel`, `steering_channel` | 2, 4 | 0..5, integer, distinct analog channels |
 | `throttle_reverse`, `steering_reverse` | 0, 0 | 0 or 1 |
+| `strafe_channel`, `strafe_reverse` | 1, 0 | Channel 0..5, reverse 0/1; all three motion channels must differ for improved gaits |
+| `motion_stride` | 40 | 0..80 mm, full improved-gait translation per cycle |
+| `motion_lift` | 25 | 0..80 mm, improved-gait peak foot lift |
+| `motion_turn` | 10 | 0..20 degrees, full improved-gait yaw per cycle |
+| `motion_cycle_ms` | 1800 | 600..6000, integer; fastest tripod cycle at full demand |
 
 Changing `servo_hz`, either oscillator frequency or `i2c_hz` requires `init` before servo output can resume. Changing `radio_channel` requires `init` before radio mode. The console reports pending initialization; geometry, gait and calibration changes need no reinitialization. `load`/`defaults` follow these same rules. `init` never enables outputs.
 
-Default gait period is approximately `update_ms / phase_step`, or 667 ms. Slow I2C settings, diagnostics and processing overhead may limit the achievable update rate. Bounds protect software validity, **not** mechanical safety; inspect clearance throughout a complete supported gait cycle. Link-length/home changes must also satisfy the home stance reach check. Change interdependent parameters in an order that keeps each intermediate configuration valid.
+The default **legacy** gait period is approximately `update_ms / phase_step`, or 667 ms.
+Improved gaits use measured elapsed time and their separate `motion_*` parameters;
+`step_length`, `step_height`, `rotation_step`, `phase_step`, and `smoothing` remain legacy-only.
+All gaits share geometry, `home_z`, joint limits, calibration, and the output scheduler.
+Slow I2C settings and processing overhead may limit the achievable update rate. Bounds
+protect software validity, **not** mechanical safety; inspect clearance throughout a
+complete supported cycle. Link-length/home changes must satisfy the home reach check.
+Change interdependent parameters in an order that keeps each intermediate configuration valid.
 
 Use a scope to calibrate each PCA9685 oscillator against known commanded pulse widths. PWM conversion uses the configured oscillator and the read-back prescaler. GPIO wiring, PCA9685 addresses and leg/channel assignments stay fixed to the wiring diagram; console tuning does not change physical wiring or the transmitter's firmware.
+
+### Improved gaits
+
+The motion module in [HexapodMotion.h](HexapodMotion.h) adapts the donor's phase tables and
+swing/stance ideas to our RF/RM/RR/LR/LM/LF order, geometry, MG996R calibration, and PCA9685
+outputs. It does **not** import the donor's link lengths, mounting offsets, parked pose,
+Dynamixel torque/gain settings, controller, or peripherals.
+
+| Gait | Swing fraction | Nominal minimum stance legs | Fastest cycle with defaults |
+|---|---:|---:|---:|
+| Tripod | 1/2 | 3 | 1800 ms |
+| Tetrapod | 1/3 | 4 | about 2571 ms |
+| Ripple | 0.32 | 4 | about 2571 ms |
+
+- Analog commands scale stride and cadence. Diagonal translation is normalized so it
+  cannot exceed full translational stride. Rotation can be combined with translation.
+  Small commands use slower cadence; at the low end cycles approach four times the
+  gait's fastest period. Actual physical speed depends on the mechanism and ground.
+- Swing uses eased cubic horizontal travel and smooth vertical ascent/descent.
+  Unlike the donor's above-ground touchdown buffer, landing finishes **during swing**
+  so nominal stance feet are on the ground; we have no contact sensors. Steady
+  translational stance travel is linear to avoid differently phased legs fighting each other.
+- Input, lift, and tuning changes are time-filtered. Independent lift demand avoids
+  dropping all feet as forward/reverse commands cross zero. Ground-height changes
+  are limited to 20 mm/s.
+- Releasing controls, `stop`, a timed-test deadline, or radio command expiry requests
+  a soft settle, normally taking **1.2 seconds** for improved gaits. The timeout/test
+  deadline ends the requested travel, not all servo movement. Improved-to-improved
+  changes settle first, then resume the current input; seamless mid-stride blending
+  is deferred. Legacy transitions retain the original return-home smoothing.
+- Integration is capped at 50 ms per frame, with no catch-up bursts after a stall.
+  Excessive loop delays can extend settling time; `status` reports delayed-frame counts.
+  The target interval remains `update_ms` (10 ms default) and PWM remains 50 Hz.
+- Every improved frame is checked for reach and joint/trim limits **before any
+  joint is queued**. A violation reports the leg/reason, cancels driving and holds
+  the last complete commanded pose in `pose` mode. It does not release torque.
+  Use `status`, then supported `off`/adjustment or explicit `home` to retry.
+  I2C write faults and `off`/`!` still disable outputs immediately.
+
+These are open-loop foot trajectories, not measured foot placement. The numerical
+support pattern is not proof of balance, contact, collision avoidance, or available
+servo torque. No new gait has been validated on the assembled robot.
+
+**First supported trial:** confirm the stored link lengths, origins, trims, directions,
+and pulse limits match the actual assembly. Do not substitute the donor's drawings.
+With the body supported, send these commands **individually**, inspecting each result:
+
+```text
+off
+gait tripod
+tune motion_stride 20
+tune motion_lift 15
+tune motion_turn 5
+tune motion_cycle_ms 2500
+home
+move 0.25 0 0 1000
+stop
+```
+
+After forward/reverse checks, separately test `move 0 0.25 0 1000` (left strafe) and
+`move 0 0 0.25 1000` (turn). Then evaluate tetrapod and ripple, returning home between
+tests. Keep the body supported and a power disconnect accessible. Only move to
+short floor trials after checking all six legs, full-cycle clearance, load and power.
+`off` followed by `save` explicitly stores your selected startup gait and tuning;
+`gait legacy` returns to the original engine. Selection never enables outputs.
+
+Body posing, new stand/park paths, gait blending, turning lean, IMU levelling, and
+LCD/controller-specific features remain deferred. The module retains Christoph
+Streit's MIT notice for the adapted motion design.
 
 ### Example tuning session
 
@@ -361,13 +476,24 @@ Send commands individually and inspect each result. Only increase a test's ampli
 
 `save` stores the complete validated configuration in one versioned, checksummed **Preferences/NVS** record (`hexapod` namespace, `settings` key), then verifies the stored bytes. No tuning command auto-saves. `load` restores the whole configuration or leaves it unchanged on failure. `defaults` does not erase flash until you explicitly `save`.
 
-Valid settings load automatically on boot, **but output enable state, pose, arming and motion commands are never saved**. Every reset starts off. Missing saved data uses documented defaults; corrupt/incompatible records or storage errors are reported. At boot those errors leave factory defaults active with outputs disabled; at runtime a failed load retains the current settings. A future incompatible settings layout needs a new record version and recalibration/re-saving. Erasing flash/NVS removes saved settings.
+Valid settings load automatically on boot, **but output enable state, pose, arming and motion commands are never saved**. Every reset starts off. Missing saved data uses documented defaults; corrupt/incompatible records or storage errors are reported. At boot those errors leave factory defaults active with outputs disabled; at runtime a failed load retains the current settings. Erasing flash/NVS removes saved settings.
+
+Version-1 records are migrated to version 2 **in RAM**, preserving the original geometry,
+control mapping and all eighteen calibrations. New parameters receive conservative defaults
+and `legacy` is selected. Migration is logged and marked unsaved; flash is not rewritten
+until `save`. Version-2 records also retain gait selection and improved-motion parameters.
+If an old throttle/steering mapping uses channel 1, choose a distinct `strafe_channel`
+while off before selecting an improved gait.
 
 ## 8. Browser control and fallback AP
 
 1. Power on with the robot supported. **Boot remains off.** When no fresh valid ESP-NOW packets are arriving, connect a phone or computer to **`Hexapod-XXXXXX`** (suffix from the receiver STA MAC). The SSID and address are also printed on Serial.
 2. The AP is intentionally **open, with no password**, and allows one associated device at a time. Stay connected when your phone warns that there is no Internet. Open **http://192.168.4.1** manually; there is no captive-portal redirect.
-3. Use **Enable driving / home**, then hold the direction buttons, W/A/S/D, or arrow keys. You can combine forward/reverse with turning. Releasing controls returns toward home. **Stop / hold home** ends the driving session; **Outputs off** disables pulses and releases torque.
+3. Use **Enable driving / home**, then hold direction buttons, W/A/S/D, or arrow keys.
+   Improved gaits also offer strafe buttons and Q/E. The command-strength slider scales
+   all axes. **Gait and motion** selects a gait and applies live tuning without ending
+   web driving; other console commands retain their explicit-stop behavior. Releasing
+   controls requests settling. **Stop / hold home** ends driving; **Outputs off** releases torque.
 4. The same page provides joint angles/pulses, the leg-by-leg servo sequence, calibration, parameter edits, settings save/load, initialization and the full command console. These use the same validation, off-mode restrictions, pulse limits and persistence rules as Serial. Read current settings while off before adjusting calibration; only **Save to flash** persists changes.
 
 The entire page is embedded in firmware: no external scripts, Internet, filesystem upload, or extra Arduino library is required. The server uses the ESP32 core's bundled `esp_http_server`. Do not expose this AP to untrusted users: **any nearby device can connect and control the robot**, including enabling outputs or changing calibration. A per-boot request token blocks ordinary cross-origin browser submissions; it is not user authentication or encryption.
@@ -375,7 +501,7 @@ The entire page is embedded in firmware: no external scripts, Internet, filesyst
 ### Source priority and disconnect behavior
 
 - ESP-NOW is connectionless. A **fresh, correctly formatted packet**, not merely an initialized receiver, counts as an active signal. The AP and STA share `radio_channel`, so ESP-NOW reception continues while the AP is on. The transmitter must target the **STA MAC**, not the AP MAC.
-- Fresh ESP-NOW packets **switch off the AP and disconnect the browser in every mode**. During web driving they immediately clear browser motion, select radio control, and require centered sticks before radio movement. Boot/off, direct poses, home, timed serial walks, and servo sequences remain protected from automatic radio motion.
+- Fresh ESP-NOW packets **switch off the AP and disconnect the browser in every mode**. During web driving they immediately clear browser motion, select radio control, and require centered sticks before radio movement. Boot/off, direct poses, home, timed serial walks, and servo sequences remain protected from automatic radio motion; only a deliberate 1-second K1 hold changes them (off: stand up in radio mode; any other mode: disable outputs).
 - With no valid packet for `timeout_ms` (**500 ms default**), the AP returns. Radio motion stops through its existing watchdog. Reconnecting a browser never resumes its previous motion: explicitly enable web driving again. Invalid/stale packets do not suppress the AP. Network startup failures are logged and retried every five seconds.
 - Web driving sends a neutral heartbeat immediately after enabling, then sends heartbeats every 50 ms with at most one in flight, including during home startup. Successful heartbeat replies include status; separate status polling pauses while driving so it cannot queue ahead of heartbeats on the single-task HTTP server. **There is no web-driving timeout.** Missing heartbeats do not cancel startup, change the control session, or clear the last motion command. Lost focus, a hidden/closed page, or a connection error attempts to send Stop, but **motion may continue indefinitely if that request cannot be delivered**. Use Serial `stop`/`off` or the physical power disconnect if the page cannot reach the robot. Before sending other console commands while driving, the page explicitly stops driving rather than relying on a timeout. Stale requests and commands from an earlier control session cannot restart movement. A second page can explicitly enable a new driving session, which invalidates the first.
 - Disabling the web-driving timeout does not change the ESP-NOW watchdog, timed `walk` deadlines, calibration poses, or servo sequences. Those retain the console's normal hold/deadline/leg-pause behavior even if Wi-Fi disappears. ESP-NOW can therefore remove the AP while a servo test continues to its next pause. Keep Serial and a physical power disconnect available.
@@ -386,30 +512,44 @@ Before putting the robot on the ground, bench-test a held browser direction foll
 ## Troubleshooting
 
 - **Missing PCA9685 / disabled outputs:** check VCC=3.3 V, shared ground, SDA/SCL, and A0 on board #2. Both drivers are required. Fix the fault and use `init`. `scan` may also show the PCA9685 all-call address 0x70; that is not a third board.
-- **No servo movement:** boot is intentionally off. Check `status`, external servo power and grounds, and the correct S/PWM pins; use a deliberate `servo`, `center`, `home` or `radio` command after calibration.
+- **No servo movement:** boot is intentionally off. Check `status`, external servo power and grounds, and the correct S/PWM pins; use a deliberate `servo`, `center`, `home` or `radio` command (or a 1-second K1 hold) after calibration.
 - **Wrong leg/joint moves:** use the robot-perspective channel table; board #2 starts at **channel 7 with the left rear**, not left front.
-- **No remote control:** select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Automatic radio takeover is limited to active web driving; all other modes require explicitly selecting `radio`.
+- **No remote control:** hold K1 for 1 second from off, or select `radio`; check receiver STA MAC, matching Wi-Fi channels, neutral sticks and `status`. Apart from a K1 hold, automatic radio takeover is limited to active web driving; all other modes require explicitly selecting `radio`.
 - **No browser/AP:** a fresh ESP-NOW signal intentionally removes the AP. Turn the transmitter off and wait at least `timeout_ms`. Check Serial for network errors, connect to the printed open SSID, accept the no-Internet warning, and browse to http://192.168.4.1. Only one device may associate at a time. Pending channel changes require Serial `init`.
 - **Web timeout immediately after enabling:** this firmware no longer expires web driving when heartbeats are missing. If Serial still reports `Web control timeout`, rebuild and upload the updated firmware, then reload the control page. `control source changed` can still occur after an explicit command, another page enabling driving, or ESP-NOW takeover; refresh status and explicitly enable again. HTTP request deadlines and stale-request rejection remain enabled; `timeout_ms` controls ESP-NOW, not web driving.
 - **Resets/jitter:** check servo current demand, power/ground routing, bulk capacitance, and short I2C wiring. Never join a 5 V pull-up to an ESP32 GPIO.
-- **Browser driving versus a smooth reduced-stride walk:** buttons/keys still send full-strength axes (`-1`/`1`); `walk 0.25 0 5000` uses a quarter-length translation at the same gait cadence and foot lift. Compare equivalent commands only after checking clearance with the body supported. Web, radio and timed walks share the same frame-based output scheduler; heartbeat updates do not restart the gait. Rebuild/upload to replace the older per-joint gait scheduler. Host timing tests cannot establish whether remaining jitter is electrical or mechanical.
+- **Browser versus timed walking:** compare the same gait, tuning and command strength.
+  The browser slider defaults to full strength. In legacy, `walk 0.25 0 5000` reduces
+  stride but not cadence/lift; improved gaits scale cadence and lift as well. Heartbeats
+  do not restart the gait. Host tests cannot establish whether jitter is electrical or mechanical.
 - **Brownout during Initialize drivers / radio:** `init` never enables servos. If they move during initialization, check both OE connections to GPIO23 and the external pull-up, including OE during reset. If resets persist with servo power disconnected, check the ESP32's own supply/USB cable/regulator under Wi-Fi load. Staggered motion cannot repair a supply or grounding fault.
 - **I2C error during motion:** both OEs are driven high; motion stops but the console remains available. Loss of pulses may release servo torque, so the robot can collapse. Fix the fault, then `init`; output remains off until explicitly enabled. A software failsafe or OE is not a substitute for supporting the robot and a physical power disconnect.
 
 ## Validation
 
-The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, the complete one-servo-at-a-time sequence (angle order, 1000 ms holds, disabled pauses after every leg, repeated leg retests including the final leg, explicit advancement/completion, calibration, cancellation, radio isolation, control handovers, timer wraparound and I2C failures), saved-setting reboot/load/write failures, control-source transitions, the 10-second walking limit and recovery after I2C faults.
+The firmware targets ESP32 Arduino core **3.3.12** and Adafruit PWM Servo Driver **3.0.3**. [tests/test_control.cpp](tests/test_control.cpp) covers the full ADC ranges, protocol/failsafe, the K1 long-press detector (stuck button, taps, signal gaps, wraparound), servo mapping/PWM, command parsing/overflow, parameter validation, record round-trips/corruption and timer wraparound. [tests/test_firmware.cpp](tests/test_firmware.cpp) runs the actual sketch against hardware fakes to check serial commands, disabled startup, selective servo enable, the complete one-servo-at-a-time sequence (angle order, 1000 ms holds, disabled pauses after every leg, repeated leg retests including the final leg, explicit advancement/completion, calibration, cancellation, radio isolation, control handovers, timer wraparound and I2C failures), saved-setting reboot/load/write failures, control-source transitions, the remote-only K1 stand-up/power-off cycle (including driver-init retry), the 10-second walking limit and recovery after I2C faults.
 
 Run the tests from a Visual Studio Developer PowerShell with MSVC installed:
 
 ```powershell
 cl /nologo /std:c++17 /EHsc /W4 /WX .\tests\test_control.cpp /Fo"$env:TEMP\hexapod-test-control.obj" /Fe"$env:TEMP\hexapod-test-control.exe"
 if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-control.exe" }
+cl /nologo /std:c++17 /EHsc /W4 /WX .\tests\test_motion.cpp /Fo"$env:TEMP\hexapod-test-motion.obj" /Fe"$env:TEMP\hexapod-test-motion.exe"
+if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-motion.exe" }
 cl /nologo /std:c++17 /EHsc /W4 /WX /wd4244 /wd4305 /I.\tests\fakes .\tests\test_firmware.cpp /Fo"$env:TEMP\hexapod-test-firmware.obj" /Fe"$env:TEMP\hexapod-test-firmware.exe"
 if ($LASTEXITCODE -eq 0) { & "$env:TEMP\hexapod-test-firmware.exe" }
 ```
 
 The integration test suppresses MSVC's double-to-float warnings for the Arduino gait math; the pure logic test uses all warnings as errors. Compilation and host tests cannot verify physical wiring, flash power-loss behavior, supply capacity, actual servo endpoints, RF reception or the gait on your assembled robot. Perform the supported bench checks above before walking.
+
+[tests/test_motion.cpp](tests/test_motion.cpp) checks remapped gait phases, nominal
+support counts and body-centre support margin at the tested defaults, exact peak lift,
+trajectory continuity, linear translational stance travel, reversal lift retention,
+bounded settling, height slew, cadence consistency at 5/10/50 ms, and delayed-frame
+clamping. Control/firmware tests cover proportional ADC mapping and three-axis arming,
+version-1 migration without calibration loss or automatic flash writes, all improved
+gaits and motion axes, settled transitions, live tuning/session preservation, invalid
+frames holding a complete pose, and unchanged I2C-fault disabling.
 
 The firmware tests also exercise the HTTP handlers, request validation/token checks, command errors and calibration feedback, open-AP startup/channel sharing, valid/stale/invalid ESP-NOW priority, neutral-stick handoff, AP timeout/retry, web startup and driving without heartbeats (including the former 500 ms boundary, an hour without updates, and timer wraparound), stale-session rejection, slow requests, and serial/I2C interruption of browser driving. Timestamped PWM fakes verify the 250 ms pose/startup spacing, complete gait-frame writes at 5/10/50 ms target intervals, identical web/timed-walk output traces at matching full and reduced strengths even with repeated heartbeats, no replay of missed frames after loop delays or timer wrap, immediate cancellation on a mid-frame I2C fault, timed-walk startup gating, disabled outputs during web initialization, and phase-offset pulse widths (including frame wrap at 40/50/60 Hz).
 

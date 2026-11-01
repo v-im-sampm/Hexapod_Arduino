@@ -48,7 +48,9 @@ Driving waits until ready. Stop cancels pending startup moves and holds only the
 </section>
 <div class="grid">
 <section><h2>Drive</h2>
-<p>Hold a button or W/A/S/D or arrow keys. Release to stop. Forward/backward and turning can be combined.</p>
+<p>Hold W/A/S/D or arrow keys to walk/turn. Q/E strafe with improved gaits.
+Combine axes for diagonal travel and turns. Release to settle.</p>
+<label>Command strength<input id="drive-strength" type="range" min="0.1" max="1" step="0.05" value="1"></label>
 <div class="pad">
 <button class="forward" data-direction="1" data-rotation="0" disabled>Forward</button>
 <button class="left" data-direction="0" data-rotation="1" disabled>Left</button>
@@ -56,9 +58,28 @@ Driving waits until ready. Stop cancels pending startup moves and holds only the
 <button data-direction="0" data-rotation="-1" disabled>Right</button>
 <button class="back" data-direction="-1" data-rotation="0" disabled>Reverse</button>
 </div>
+<div class="row"><button data-direction="0" data-rotation="0" data-strafe="1" disabled>Strafe left (Q)</button>
+<button data-direction="0" data-rotation="0" data-strafe="-1" disabled>Strafe right (E)</button></div>
 <small>Web driving has no timeout: the last motion command remains active until replaced or stopped.
 A hidden tab, lost focus, or connection error attempts to stop, but motion may continue if delivery fails.
 Use Serial stop/off or the physical power disconnect if the page cannot reach the robot.</small>
+</section>
+<section><h2>Gait and motion</h2>
+<form id="gait-form"><div class="row"><label>Gait<select id="gait">
+<option value="legacy">Original (legacy)</option><option value="tripod">Improved tripod</option>
+<option value="tetrapod">Tetrapod</option><option value="ripple">Ripple</option>
+</select></label><button>Select gait</button></div></form>
+<form id="tune-form"><div class="row"><label>Live parameter<select id="motion-param">
+<option value="motion_stride">Stride (0-80 mm)</option><option value="motion_lift">Lift (0-80 mm)</option>
+<option value="motion_turn">Turn per cycle (0-20 deg)</option>
+<option value="motion_cycle_ms">Fastest tripod cycle (600-6000 ms)</option>
+<option value="home_z">Foot ground Z (-200 to -1 mm)</option>
+</select></label><label>Value<input id="motion-value" type="number" step="any" value="40" required></label>
+<button>Apply tuning</button></div></form>
+<small>Selection never enables outputs. Changes are in RAM until Save while off.
+Gait changes settle before resuming. Live tuning requires an improved gait; other settings stay off-only.
+More negative ground Z raises the body. Ranges are not a mechanical safety guarantee.
+Support the robot for first trials. A motion-limit fault holds the last complete pose.</small>
 </section>
 <section><h2>Servo sequence</h2>
 <p>Outputs must be off to start. Each joint moves 90 / 85 / 95 / 90 degrees, then pauses after each leg.</p>
@@ -107,11 +128,13 @@ placeholder="status, origin rf 103 -60, joints rf 90 90 90..." autocomplete="off
 Changing radio_channel and running init can disconnect Wi-Fi; reconnect afterward.</small>
 <pre id="log" role="log" aria-live="polite">Waiting for controller status.</pre>
 </section>
-<script>
+)HTML"
+R"HTML(<script>
 'use strict';
 const $ = id => document.getElementById(id);
 let token = '', generation = 0, driveGeneration = 0, enabled = false, online = false;
 let commandBusy = false, driveBusy = false, statusBusy = false, version = 0;
+let selectedGait = 'legacy';
 const held = new Map(), calibrations = new Map();
 const driveButtons = [...document.querySelectorAll('[data-direction]')];
 function log(text) { $('log').textContent = (text + '\n\n' + $('log').textContent).slice(0, 6000); }
@@ -123,6 +146,10 @@ function localStop() {
   enabled = false;
   clearHeld();
   driveButtons.forEach(button => button.disabled = true);
+}
+function updateDriveButtons() {
+  driveButtons.forEach(button => button.disabled = !enabled ||
+    (selectedGait === 'legacy' && Number(button.dataset.strafe || 0) !== 0));
 }
 function disconnected(error) {
   leavePage();
@@ -154,11 +181,12 @@ function fillCalibration() {
 async function command(text) {
   const ownVersion = ++version;
   const wasEnabled = enabled;
-  localStop();
+  const live = /^(gait|tune)\s/i.test(text);
+  if (!live) localStop();
   commandBusy = true;
   try {
     if (!online) throw new Error('Not connected. Reconnect to the Hexapod AP and wait for status.');
-    if (wasEnabled && !/^(web|stop|off|!)$/i.test(text)) {
+    if (wasEnabled && !live && !/^(web|stop|off|!)$/i.test(text)) {
       const stopped = await request('/api/command', 'stop', driveGeneration);
       if (ownVersion !== version) return;
       if (!stopped.ok) throw new Error(stopped.text);
@@ -168,6 +196,7 @@ async function command(text) {
     if (ownVersion !== version) return;
     generation = result.generation;
     log('> ' + text + '\n' + result.text);
+    if (live && wasEnabled && generation !== driveGeneration) localStop();
     if (result.ok && text.toLowerCase() === 'show') {
       calibrations.clear();
       for (const line of result.text.split('\n')) {
@@ -180,7 +209,7 @@ async function command(text) {
     if (result.ok && text.toLowerCase() === 'web' && !document.hidden) {
       enabled = true;
       driveGeneration = generation;
-      driveButtons.forEach(button => button.disabled = false);
+      updateDriveButtons();
     }
   } catch (error) {
     if (ownVersion === version) disconnected(error);
@@ -198,11 +227,17 @@ function updateStatus(text) {
   generation = state.generation;
   online = true;
   if (enabled && (state.mode !== 'web' || generation !== driveGeneration)) localStop();
+  if (state.gait === 'legacy' && selectedGait !== 'legacy') clearHeld();
+  selectedGait = state.gait;
+  updateDriveButtons();
   $('status').textContent = 'Connected | Mode: ' + state.mode + (enabled ? ' | Driving enabled' : '');
   $('details').textContent = (state.drivers ? 'Drivers ready' : 'Drivers need init') +
     ' | ' + (state.dirty ? 'Unsaved changes' : 'Settings saved/default') +
     (state.radioReady ? ' | Listening for ESP-NOW' : ' | ESP-NOW needs init') +
-    (state.posePending ? ' | Moving joints in sequence - please wait' : '');
+    (state.posePending ? ' | Moving joints in sequence - please wait' : '') +
+    ' | Gait: ' + state.activeGait + (state.gait !== state.activeGait ? ' -> ' + state.gait : '') +
+    (state.settling ? ' | Settling' : '') +
+    (state.motionFault ? ' | MOTION LIMIT: pose held; inspect Serial/status before retrying' : '');
   $('enable').disabled = !state.drivers;
   $('next').disabled = $('retest').disabled = state.mode !== 'testservos-paused';
   $('sequence').textContent = state.mode.startsWith('testservos') ?
@@ -212,14 +247,19 @@ function updateStatus(text) {
 }
 async function heartbeat() {
   if (!enabled || driveBusy || commandBusy || document.hidden) return;
-  let direction = 0, rotation = 0;
-  for (const value of held.values()) { direction += value[0]; rotation += value[1]; }
-  direction = Math.max(-1, Math.min(1, direction));
-  rotation = Math.max(-1, Math.min(1, rotation));
+  let direction = 0, rotation = 0, strafe = 0;
+  for (const value of held.values()) {
+    direction += value[0]; rotation += value[1]; strafe += value[2] || 0;
+  }
+  const strength = Number($('drive-strength').value);
+  direction = Math.max(-1, Math.min(1, direction)) * strength;
+  rotation = Math.max(-1, Math.min(1, rotation)) * strength;
+  strafe = Math.max(-1, Math.min(1, strafe)) * strength;
   const ownVersion = version;
   driveBusy = true;
   try {
-    const result = await request('/api/drive', direction + ' ' + rotation, driveGeneration);
+    const payload = direction + ' ' + rotation + (strafe === 0 ? '' : ' ' + strafe);
+    const result = await request('/api/drive', payload, driveGeneration);
     if (ownVersion !== version) return;
     if (!result.ok || result.generation !== driveGeneration) {
       localStop();
@@ -249,10 +289,11 @@ document.querySelectorAll('[data-command]').forEach(button =>
   button.addEventListener('click', () => command(button.dataset.command)));
 driveButtons.forEach(button => {
   button.addEventListener('pointerdown', event => {
-    if (!enabled || event.button !== 0) return;
+    if (!enabled || button.disabled || event.button !== 0) return;
     event.preventDefault();
     button.setPointerCapture(event.pointerId);
-    held.set('p' + event.pointerId, [Number(button.dataset.direction), Number(button.dataset.rotation)]);
+    held.set('p' + event.pointerId, [Number(button.dataset.direction), Number(button.dataset.rotation),
+      Number(button.dataset.strafe || 0)]);
     button.classList.add('held');
     heartbeat();
   });
@@ -264,11 +305,11 @@ driveButtons.forEach(button => {
   ['pointerup','pointercancel','lostpointercapture'].forEach(name => button.addEventListener(name, release));
 });
 const keys = {w:[1,0],ArrowUp:[1,0],s:[-1,0],ArrowDown:[-1,0],
-              a:[0,1],ArrowLeft:[0,1],d:[0,-1],ArrowRight:[0,-1]};
+              a:[0,1],ArrowLeft:[0,1],d:[0,-1],ArrowRight:[0,-1],q:[0,0,1],e:[0,0,-1]};
 document.addEventListener('keydown', event => {
   if (!enabled || /INPUT|SELECT|TEXTAREA/.test(event.target.tagName)) return;
   const value = keys[event.key] || keys[event.key.toLowerCase()];
-  if (!value) return;
+  if (!value || (value[2] && selectedGait === 'legacy')) return;
   event.preventDefault();
   held.set('k' + event.code, value);
   heartbeat();
@@ -297,9 +338,12 @@ form('pulse-form', () => 'pulse ' + joint() + ' ' + $('pulse').value);
 form('cal-form', () => 'cal ' + joint() + ' ' +
   ['min-us','max-us','trim','reverse'].map(id => $(id).value).join(' '));
 form('param-form', () => 'set ' + $('param').value + ' ' + $('value').value);
+form('gait-form', () => 'gait ' + $('gait').value);
+form('tune-form', () => 'tune ' + $('motion-param').value + ' ' + $('motion-value').value);
 form('console-form', () => $('command').value.trim() || 'next');
 $('leg').addEventListener('change', fillCalibration);
 $('joint').addEventListener('change', fillCalibration);
+$('drive-strength').addEventListener('input', heartbeat);
 $('center-leg').addEventListener('click', () => command('center ' + $('leg').value));
 $('defaults').addEventListener('click', () => {
   if (confirm('Replace RAM settings with factory defaults? Flash is unchanged until Save.')) command('defaults');

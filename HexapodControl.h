@@ -15,6 +15,19 @@ constexpr uint8_t ESPNOW_CHANNEL = 1;
 constexpr uint32_t CONTROL_TIMEOUT_MS = 500;
 constexpr uint16_t STICK_CENTER = 2047;
 constexpr uint16_t STICK_DEADZONE = 100;
+constexpr size_t POWER_BUTTON_CHANNEL = 6;
+constexpr uint32_t POWER_BUTTON_HOLD_MS = 1000;
+
+enum class Gait : uint32_t { Legacy, Tripod, Tetrapod, Ripple };
+constexpr const char* GAIT_NAMES[] = {"legacy", "tripod", "tetrapod", "ripple"};
+constexpr size_t GAIT_COUNT = sizeof(GAIT_NAMES) / sizeof(GAIT_NAMES[0]);
+
+struct MotionInput
+{
+  float forward = 0;
+  float strafe = 0;
+  float turn = 0;
+};
 
 struct ServoCalibration
 {
@@ -62,6 +75,15 @@ struct Settings
     {-100.94f, 57.11f}, {0.0f, 105.72f}, {100.94f, 57.11f}
   };
   ServoCalibration servos[LEG_COUNT][JOINT_COUNT] = {};
+
+  // Keep the version-1 prefix unchanged; its NVS records are migrated by HexapodConsole.
+  uint32_t gait = uint32_t(Gait::Legacy);
+  float motionStride = 40.0f;
+  float motionLift = 25.0f;
+  float motionTurn = 10.0f;
+  uint32_t motionCycleMs = 1800;
+  uint32_t strafeChannel = 1;
+  uint32_t strafeReversed = 0;
 
   uint32_t oscillatorHz(size_t board) const
   {
@@ -127,10 +149,21 @@ inline float stickCommand(uint16_t value, uint32_t center = STICK_CENTER,
   return 0.0f;
 }
 
+inline float proportionalStick(uint16_t value, uint32_t center, uint32_t deadzone)
+{
+  const uint32_t low = center - deadzone, high = center + deadzone;
+  if (value < low)
+    return float(low - value) / float(low);
+  if (value > high)
+    return -float(value - high) / float(4095 - high);
+  return 0.0f;
+}
+
 struct ControlState
 {
   float direction = 0.0f;
   float rotation = 0.0f;
+  float strafe = 0.0f;
   bool armed = false;
   bool hasSignal = false;
   uint32_t lastPacketMs = 0;
@@ -139,7 +172,7 @@ struct ControlState
   {
     if (!hasSignal || uint32_t(now - lastPacketMs) < timeoutMs)
       return false;
-    direction = rotation = 0.0f;
+    direction = rotation = strafe = 0.0f;
     armed = hasSignal = false;
     return true;
   }
@@ -152,17 +185,60 @@ struct ControlState
 
     lastPacketMs = packet.receivedAtMs;
     hasSignal = true;
-    const float nextDirection = stickCommand(packet.channels[settings.throttleChannel],
+    const bool improved = settings.gait != uint32_t(Gait::Legacy);
+    const auto readStick = improved ? proportionalStick : stickCommand;
+    const float nextDirection = readStick(packet.channels[settings.throttleChannel],
         settings.stickCenter, settings.stickDeadzone) * (settings.throttleReversed ? -1 : 1);
-    const float nextRotation = stickCommand(packet.channels[settings.steeringChannel],
+    const float nextRotation = readStick(packet.channels[settings.steeringChannel],
         settings.stickCenter, settings.stickDeadzone) * (settings.steeringReversed ? -1 : 1);
-    if (!armed && nextDirection == 0.0f && nextRotation == 0.0f)
+    const float nextStrafe = improved ? proportionalStick(packet.channels[settings.strafeChannel],
+        settings.stickCenter, settings.stickDeadzone) * (settings.strafeReversed ? -1 : 1) : 0.0f;
+    if (!armed && nextDirection == 0.0f && nextRotation == 0.0f && nextStrafe == 0.0f)
       armed = true;
     if (armed)
     {
       direction = nextDirection;
       rotation = nextRotation;
+      strafe = nextStrafe;
     }
+    return true;
+  }
+};
+
+// Long-press detector for the low-active transmitter button. A press only counts after the
+// button has been seen released, so a stuck/held button at power-on or after signal loss
+// cannot toggle the robot; each hold triggers once.
+struct ButtonHold
+{
+  bool released = false;
+  bool pressing = false;
+  bool seen = false;
+  uint32_t pressedAtMs = 0;
+  uint32_t lastPacketMs = 0;
+
+  bool update(bool pressed, uint32_t now, uint32_t timeoutMs = CONTROL_TIMEOUT_MS,
+              uint32_t holdMs = POWER_BUTTON_HOLD_MS)
+  {
+    if (seen && uint32_t(now - lastPacketMs) >= timeoutMs)
+      released = pressing = false;
+    seen = true;
+    lastPacketMs = now;
+    if (!pressed)
+    {
+      released = true;
+      pressing = false;
+      return false;
+    }
+    if (!released)
+      return false;
+    if (!pressing)
+    {
+      pressing = true;
+      pressedAtMs = now;
+    }
+    if (uint32_t(now - pressedAtMs) < holdMs)
+      return false;
+    released = pressing = false;
     return true;
   }
 };

@@ -37,7 +37,10 @@ constexpr FloatParameter FLOAT_PARAMETERS[] =
   {"phase_step", &Settings::phaseStep, 0.001f, 0.05f},
   {"coxa_min", &Settings::coxaMin, 0, 180},
   {"coxa_max", &Settings::coxaMax, 0, 180},
-  {"servo_hz", &Settings::servoHz, 40, 60}
+  {"servo_hz", &Settings::servoHz, 40, 60},
+  {"motion_stride", &Settings::motionStride, 0, 80},
+  {"motion_lift", &Settings::motionLift, 0, 80},
+  {"motion_turn", &Settings::motionTurn, 0, 20}
 };
 
 constexpr IntegerParameter INTEGER_PARAMETERS[] =
@@ -53,7 +56,10 @@ constexpr IntegerParameter INTEGER_PARAMETERS[] =
   {"throttle_channel", &Settings::throttleChannel, 0, 5},
   {"steering_channel", &Settings::steeringChannel, 0, 5},
   {"throttle_reverse", &Settings::throttleReversed, 0, 1},
-  {"steering_reverse", &Settings::steeringReversed, 0, 1}
+  {"steering_reverse", &Settings::steeringReversed, 0, 1},
+  {"motion_cycle_ms", &Settings::motionCycleMs, 600, 6000},
+  {"strafe_channel", &Settings::strafeChannel, 0, 5},
+  {"strafe_reverse", &Settings::strafeReversed, 0, 1}
 };
 
 inline bool validateSettings(const Settings& settings, const char*& error)
@@ -74,7 +80,13 @@ inline bool validateSettings(const Settings& settings, const char*& error)
       error = parameter.name;
       return false;
     }
-  if (settings.coxaMin >= settings.coxaMax)
+  if (settings.gait >= GAIT_COUNT)
+    error = "unknown gait";
+  else if (settings.gait != uint32_t(Gait::Legacy) &&
+           (settings.strafeChannel == settings.throttleChannel ||
+            settings.strafeChannel == settings.steeringChannel))
+    error = "strafe, throttle and steering channels must differ for improved gaits";
+  else if (settings.coxaMin >= settings.coxaMax)
     error = "coxa_min must be less than coxa_max";
   else if (settings.stickCenter < settings.stickDeadzone ||
            settings.stickCenter + settings.stickDeadzone > 4095)
@@ -191,7 +203,8 @@ inline bool setParameter(Settings& settings, const char* name, const char* text,
 enum class CommandType
 {
   Help, Status, Show, Params, Save, Load, Defaults, Init, Scan, Off, Stop, Home, Radio, Web,
-  Center, Servo, Pulse, Joints, Foot, Walk, TestServos, Next, Retest, Set, Calibrate, Origin
+  Center, Servo, Pulse, Joints, Foot, Walk, TestServos, Next, Retest, Set, Calibrate, Origin,
+  Gait, Tune
 };
 
 struct Command
@@ -201,6 +214,7 @@ struct Command
   size_t joint = 0;
   float values[4] = {};
   uint32_t durationMs = 0;
+  Gait gait = Gait::Legacy;
   const char* name = nullptr;
   const char* text = nullptr;
 };
@@ -272,9 +286,17 @@ inline bool parseCommand(char* line, Command& command, const char*& error)
       return true;
     }
 
-  if (strcmp(tokens[0], "set") == 0 && count == 3)
+  if (strcmp(tokens[0], "gait") == 0 && count == 2)
   {
-    parsed.type = CommandType::Set;
+    size_t gait = 0;
+    if (!parseIndex(tokens[1], GAIT_NAMES, GAIT_COUNT, gait))
+      return false;
+    parsed.type = CommandType::Gait;
+    parsed.gait = Gait(gait);
+  }
+  else if ((strcmp(tokens[0], "set") == 0 || strcmp(tokens[0], "tune") == 0) && count == 3)
+  {
+    parsed.type = strcmp(tokens[0], "tune") == 0 ? CommandType::Tune : CommandType::Set;
     parsed.name = tokens[1];
     parsed.text = tokens[2];
   }
@@ -284,6 +306,15 @@ inline bool parseCommand(char* line, Command& command, const char*& error)
     if (!parseNumber(tokens[1], -1, 1, parsed.values[0]) ||
         !parseNumber(tokens[2], -1, 1, parsed.values[1]) ||
         !parseInteger(tokens[3], 100, 10000, parsed.durationMs))
+      return false;
+  }
+  else if (strcmp(tokens[0], "move") == 0 && count == 5)
+  {
+    parsed.type = CommandType::Walk;
+    if (!parseNumber(tokens[1], -1, 1, parsed.values[0]) ||
+        !parseNumber(tokens[2], -1, 1, parsed.values[2]) ||
+        !parseNumber(tokens[3], -1, 1, parsed.values[1]) ||
+        !parseInteger(tokens[4], 100, 10000, parsed.durationMs))
       return false;
   }
   else if (strcmp(tokens[0], "center") == 0 && (count == 1 || count == 2))
@@ -415,6 +446,7 @@ struct TimedMotion
   float rotation = 0;
   uint32_t startedMs = 0;
   uint32_t durationMs = 0;
+  float strafe = 0;
 
   bool expired(uint32_t now) const
   {
@@ -425,20 +457,38 @@ struct TimedMotion
 struct SettingsRecord
 {
   uint32_t magic = 0x48585044;
-  uint32_t version = 1;
+  uint32_t version = 2;
   Settings settings;
   uint32_t checksum = 0;
 };
 
 static_assert(std::is_trivially_copyable<SettingsRecord>::value, "Settings must remain plain data");
 
-inline uint32_t settingsChecksum(const Settings& settings)
+constexpr size_t SETTINGS_V1_BYTES = 360;
+struct SettingsRecordV1
 {
-  const auto* bytes = reinterpret_cast<const uint8_t*>(&settings);
+  uint32_t magic;
+  uint32_t version;
+  uint8_t settings[SETTINGS_V1_BYTES];
+  uint32_t checksum;
+};
+static_assert(std::is_standard_layout<Settings>::value &&
+              offsetof(Settings, gait) == SETTINGS_V1_BYTES,
+              "Do not change the version-1 settings prefix");
+static_assert(sizeof(SettingsRecordV1) == 372, "Version-1 record layout changed");
+
+inline uint32_t settingsBytesChecksum(const void* data, size_t size)
+{
+  const auto* bytes = static_cast<const uint8_t*>(data);
   uint32_t checksum = 2166136261u;
-  for (size_t i = 0; i < sizeof(settings); ++i)
+  for (size_t i = 0; i < size; ++i)
     checksum = (checksum ^ bytes[i]) * 16777619u;
   return checksum;
+}
+
+inline uint32_t settingsChecksum(const Settings& settings)
+{
+  return settingsBytesChecksum(&settings, sizeof(settings));
 }
 
 inline SettingsRecord makeSettingsRecord(const Settings& settings)
@@ -449,24 +499,47 @@ inline SettingsRecord makeSettingsRecord(const Settings& settings)
   return record;
 }
 
-inline bool decodeSettings(const void* bytes, size_t length, Settings& settings, const char*& error)
+inline bool decodeSettings(const void* bytes, size_t length, Settings& settings, const char*& error,
+                           bool* migrated = nullptr)
 {
-  if (bytes == nullptr || length != sizeof(SettingsRecord))
+  if (migrated != nullptr)
+    *migrated = false;
+  if (bytes == nullptr || (length != sizeof(SettingsRecord) && length != sizeof(SettingsRecordV1)))
   {
     error = "saved settings have an incompatible size";
     return false;
   }
-  SettingsRecord record;
-  memcpy(&record, bytes, sizeof(record));
-  if (record.magic != 0x48585044 || record.version != 1 ||
-      record.checksum != settingsChecksum(record.settings))
+  Settings candidate;
+  const bool legacy = length == sizeof(SettingsRecordV1);
+  if (legacy)
   {
-    error = "saved settings version/checksum mismatch";
-    return false;
+    SettingsRecordV1 record;
+    memcpy(&record, bytes, sizeof(record));
+    if (record.magic != 0x48585044 || record.version != 1 ||
+        record.checksum != settingsBytesChecksum(record.settings, sizeof(record.settings)))
+    {
+      error = "saved settings version/checksum mismatch";
+      return false;
+    }
+    memcpy(&candidate, record.settings, SETTINGS_V1_BYTES);
   }
-  if (!validateSettings(record.settings, error))
+  else
+  {
+    SettingsRecord record;
+    memcpy(&record, bytes, sizeof(record));
+    if (record.magic != 0x48585044 || record.version != 2 ||
+        record.checksum != settingsChecksum(record.settings))
+    {
+      error = "saved settings version/checksum mismatch";
+      return false;
+    }
+    candidate = record.settings;
+  }
+  if (!validateSettings(candidate, error))
     return false;
-  settings = record.settings;
+  settings = candidate;
+  if (migrated != nullptr)
+    *migrated = legacy;
   return true;
 }
 }

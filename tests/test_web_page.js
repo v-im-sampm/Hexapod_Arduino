@@ -21,7 +21,15 @@ function element() {
 function createPage() {
   const elements = new Map([...source.matchAll(/id="([^"]+)"/g)]
     .map(match => [match[1], element()]));
-  const buttons = Array.from({length: 4}, element);
+  for (const match of source.matchAll(/id="([^"]+)"[^>]*value="([^"]*)"/g))
+    elements.get(match[1]).value = match[2];
+  const buttons = [...source.matchAll(/<button[^>]*data-direction="([^"]+)"[^>]*>/g)].map(match => {
+    const button = element();
+    for (const data of match[0].matchAll(/data-(direction|rotation|strafe)="([^"]+)"/g))
+      button.dataset[data[1]] = data[2];
+    button.setPointerCapture = () => {};
+    return button;
+  });
   const requests = [], intervals = new Map(), timeouts = new Map();
   const document = {
     hidden: false,
@@ -59,7 +67,8 @@ function status(overrides = {}) {
   return {
     token: 'test-token', generation: 2, mode: 'web', drivers: true,
     radioReady: true, dirty: false, posePending: true, leg: 'rf', joint: 'coxa', step: 0,
-    direction: 0, rotation: 0, ...overrides
+    direction: 0, rotation: 0, strafe: 0, gait: 'legacy', activeGait: 'legacy',
+    settling: false, motionFault: false, ...overrides
   };
 }
 
@@ -130,6 +139,61 @@ test('drive input and release still use the current session', async () => {
   page.evaluate('clearHeld()');
   page.intervals.get(50)();
   assert.equal(page.requests.shift().options.body, '2\n0 0');
+});
+
+test('proportional three-axis driving and lateral controls follow the selected gait', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  assert.equal(page.buttons.filter(button => button.dataset.strafe).every(button => button.disabled), true);
+  page.evaluate("updateStatus(" + JSON.stringify(JSON.stringify(status({
+    gait: 'tripod', activeGait: 'tripod', posePending: false
+  }))) + ")");
+  assert.equal(page.buttons.every(button => !button.disabled), true);
+  page.elements.get('drive-strength').value = '0.35';
+  page.evaluate("held.set('test', [1, -1, 1])");
+  page.intervals.get(50)();
+  const drive = page.requests.shift();
+  assert.equal(drive.options.body, '2\n0.35 -0.35 0.35');
+  await page.reply(drive, status({gait: 'legacy'}));
+  assert.equal(page.evaluate('held.size'), 0);
+  assert.equal(page.buttons.filter(button => button.dataset.strafe).every(button => button.disabled), true);
+});
+
+test('live gait and tuning commands retain the driving session and do not send stop', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  for (const text of ['gait tripod', 'tune motion_lift 20']) {
+    page.evaluate("held.set('test', [1, 0])");
+    const pending = page.evaluate('command(' + JSON.stringify(text) + ')');
+    const request = page.requests.shift();
+    assert.equal(request.options.body, '2\n' + text);
+    assert.equal(page.evaluate('enabled'), true);
+    await page.reply(request, 'Motion settings updated.');
+    await pending;
+    assert.equal(page.requests.length, 1);
+    const drive = page.requests.shift();
+    assert.equal(drive.options.body, '2\n1 0');
+    await page.reply(drive, status({gait: 'tripod', activeGait: 'tripod', settling: true}));
+    assert.match(page.elements.get('details').textContent, /Settling/);
+  }
+});
+
+test('live validation failures retain motion but an ownership change stops the page', async () => {
+  const page = createPage();
+  await enable(page);
+  await page.reply(page.requests.shift(), status());
+  let pending = page.evaluate("command('tune motion_lift 999')");
+  await page.reply(page.requests.shift(), 'ERROR: invalid range', 2, false);
+  await pending;
+  assert.equal(page.evaluate('enabled'), true);
+  assert.match(page.elements.get('log').textContent, /invalid range/);
+  await page.reply(page.requests.shift(), status());
+  pending = page.evaluate("command('gait tripod')");
+  await page.reply(page.requests.shift(), 'ERROR: control source changed', 3, false);
+  await pending;
+  assert.equal(page.evaluate('enabled'), false);
 });
 
 test('a rejected session stops heartbeats and polling never re-enables driving', async () => {

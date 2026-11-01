@@ -28,6 +28,7 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMA
 #include <atomic>
 #include <math.h>
 #include "HexapodConsole.h"
+#include "HexapodMotion.h"
 #include "HexapodWeb.h"
 
 #define POW2(x)       ((x)*(x))
@@ -71,6 +72,7 @@ bool radioInitialized = false;
 bool wireReady = false;
 bool storageReady = false;
 bool settingsDirty = false;
+bool settingsNeedMigration = false;
 
 Adafruit_PWMServoDriver pwm[DRIVER_COUNT] =
 {
@@ -91,21 +93,10 @@ std::atomic<uint32_t> rejectedPackets{0};
 ControlState control;
 ControlPacket lastPacket;
 bool havePacket = false;
+ButtonHold powerButton;
 uint32_t lastUpdateMs = 0;
 
-struct Vector
-{
-  float x;
-  float y;
-  float z;
-
-  Vector(float _x = 0.0, float _y = 0.0, float _z = 0.0)
-    : x(_x),
-    y(_y),
-    z(_z)
-  {
-  }
-};
+using Vector = FootTarget;
 
 struct Leg
 {
@@ -117,10 +108,15 @@ struct Leg
 
 Leg legs[LEG_COUNT];
 float gaitPhase = 0;
+MotionEngine motionEngine;
+Gait activeGait = Gait::Legacy;
+bool motionFault = false;
+uint32_t motionLimitCount = 0;
+uint32_t motionOverruns = 0;
 
 void calculate_ik(const Leg& leg, Vector& res);
 Vector get_foot_target(float t, size_t legIndex, float direction, float rotation);
-bool set_foot_positions(float direction, float rotation);
+bool set_foot_positions(float direction, float rotation, float strafe = 0, float elapsedMs = 0);
 void read_control();
 void read_console();
 void update_network();
@@ -138,6 +134,8 @@ void disable_outputs()
   nextServo = 0;
   memset(lastPulses, 0, sizeof(lastPulses));
   memset(targetPulses, 0, sizeof(targetPulses));
+  motionEngine.reset(settings);
+  activeGait = Gait(settings.gait);
 }
 
 bool servo_error(const char* message)
@@ -159,6 +157,9 @@ bool require_off()
 void rebuild_geometry()
 {
   gaitPhase = 0;
+  activeGait = Gait(settings.gait);
+  motionEngine.reset(settings);
+  motionFault = false;
   const float homeReach = settings.coxaLength +
       (settings.femurLength + settings.tibiaLength) * cos(M_PI / 4);
   for (size_t i = 0; i < LEG_COUNT; ++i)
@@ -234,6 +235,7 @@ bool init_control()
   xQueueReset(controlQueue);
   control = ControlState{};
   havePacket = false;
+  powerButton = ButtonHold{};
   radioReady = true;
   return true;
 }
@@ -375,19 +377,24 @@ bool load_settings(Settings& loaded)
     console.println("No saved settings.");
     return false;
   }
-  SettingsRecord record;
-  if (preferences.getBytesLength("settings") != sizeof(record) ||
-      preferences.getBytes("settings", &record, sizeof(record)) != sizeof(record))
+  uint8_t record[sizeof(SettingsRecord)] = {};
+  const size_t length = preferences.getBytesLength("settings");
+  if ((length != sizeof(SettingsRecord) && length != sizeof(SettingsRecordV1)) ||
+      preferences.getBytes("settings", record, length) != length)
   {
     console.println("ERROR: saved settings size/read failure; RAM settings unchanged.");
     return false;
   }
   const char* error = nullptr;
-  if (!decodeSettings(&record, sizeof(record), loaded, error))
+  bool migrated = false;
+  if (!decodeSettings(record, length, loaded, error, &migrated))
   {
     console.printf("ERROR: %s; RAM settings unchanged.\n", error);
     return false;
   }
+  settingsNeedMigration = migrated;
+  if (migrated)
+    console.println("Version-1 settings migrated in RAM; calibration preserved, legacy gait selected. Use save to persist.");
   console.println("Settings loaded from flash; outputs remain disabled.");
   return true;
 }
@@ -415,6 +422,7 @@ bool save_settings()
     return false;
   }
   settingsDirty = false;
+  settingsNeedMigration = false;
   console.println("Settings saved to flash and verified.");
   return true;
 }
@@ -589,10 +597,16 @@ void print_status()
       servosReady ? "ready" : "init-needed", radioReady ? "ready" : "init-needed",
       settingsDirty ? "yes" : "no", WiFi.macAddress().c_str());
   console.printf("pose-pending=%s (commanded targets, not position feedback)\n", posePending ? "yes" : "no");
+  console.printf("gait=%s active-gait=%s settling=%u motion-fault=%u limits=%lu delayed-frames=%lu\n",
+      GAIT_NAMES[settings.gait], GAIT_NAMES[size_t(activeGait)],
+      motionEngine.settling() || activeGait != Gait(settings.gait), motionFault,
+      static_cast<unsigned long>(motionLimitCount), static_cast<unsigned long>(motionOverruns));
   console.printf("armed=%u direction=%.2f rotation=%.2f configured-channel=%u AP=%s\n", control.armed,
       mode == Mode::Web ? webMotion.direction : (mode == Mode::Walk ? manualMotion.direction : control.direction),
       mode == Mode::Web ? webMotion.rotation : (mode == Mode::Walk ? manualMotion.rotation : control.rotation),
       unsigned(settings.radioChannel), apActive ? apName : "off");
+  console.printf("strafe=%.2f\n", mode == Mode::Web ? webMotion.strafe :
+      (mode == Mode::Walk ? manualMotion.strafe : control.strafe));
   if (havePacket)
   {
     console.printf("last valid RX age=%lu ms CSV=", static_cast<unsigned long>(millis() - lastPacket.receivedAtMs));
@@ -623,6 +637,9 @@ void print_help()
       "  next (or Enter on an empty line) | retest (only at the pause after each leg; outputs disabled while paused)\n"
       "  joints LEG COXA FEMUR TIBIA | foot LEG DX DY DZ (offset mm from home)\n"
       "  home | radio | walk DIRECTION ROTATION DURATION_MS (100..10000)\n"
+      "  move FORWARD STRAFE TURN DURATION_MS (axes -1..1; strafe requires improved gait)\n"
+      "  gait legacy|tripod|tetrapod|ripple (settles before changing; does not enable outputs)\n"
+      "  tune motion_stride|motion_lift|motion_turn|motion_cycle_ms|home_z VALUE\n"
       "  web (enable browser driving while fallback AP is available)\n"
       "  set NAME VALUE | cal LEG JOINT MIN_US MAX_US TRIM REVERSE\n"
       "  origin LEG X Y | save | load | defaults | init | scan\n"
@@ -633,11 +650,16 @@ void print_help()
       "next or Enter advances/finishes testservos; retest repeats the paused leg.\n"
       "stop cancels testservos holding the active joint or staying off if paused.\n"
       "Poses/startup stagger joints by 250 ms; stop cancels pending moves; driving waits for home.\n"
-      "Only save writes settings. Boot always stays off; !/off releases torque.");
+      "Only save writes settings. Boot always stays off; !/off releases torque.\n"
+      "Improved gaits opt in to proportional radio control; L2 strafes. All three axes must center to arm.\n"
+      "tune is live only for improved gaits; set/cal/origin remain off-only. Motion limits hold the last full pose.\n"
+      "Remote K1 held 1 s: off -> stand up in radio mode (retries driver init); otherwise off.");
 }
 
 void show_settings(bool ranges)
 {
+  console.printf(ranges ? "gait: legacy|tripod|tetrapod|ripple (current %s)\n" : "gait %s\n",
+                 GAIT_NAMES[settings.gait]);
   for (const FloatParameter& parameter : FLOAT_PARAMETERS)
   {
     if (ranges)
@@ -677,8 +699,76 @@ bool radio_active(uint32_t now)
 bool execute_command(const Command& command)
 {
   if (command.type != CommandType::Status && command.type != CommandType::Help &&
-      command.type != CommandType::Show && command.type != CommandType::Params)
+      command.type != CommandType::Show && command.type != CommandType::Params &&
+      command.type != CommandType::Gait && command.type != CommandType::Tune)
     ++webGeneration;
+  if (command.type == CommandType::Gait || command.type == CommandType::Tune)
+  {
+    if (posePending || mode == Mode::Pose || mode == Mode::ServoTest || mode == Mode::ServoTestPaused)
+    {
+      console.println("ERROR: finish startup or use off before gait/tuning changes.");
+      return false;
+    }
+    Settings candidate = settings;
+    const char* error = nullptr;
+    if (command.type == CommandType::Gait)
+      candidate.gait = uint32_t(command.gait);
+    else
+    {
+      if (strcmp(command.name, "motion_stride") != 0 && strcmp(command.name, "motion_lift") != 0 &&
+          strcmp(command.name, "motion_turn") != 0 && strcmp(command.name, "motion_cycle_ms") != 0 &&
+          strcmp(command.name, "home_z") != 0)
+      {
+        console.println("ERROR: tune accepts only motion_stride/lift/turn/cycle_ms or home_z.");
+        return false;
+      }
+      if (mode != Mode::Off && (activeGait == Gait::Legacy || activeGait != Gait(settings.gait)))
+      {
+        console.println("ERROR: live tuning requires an active improved gait; otherwise use off.");
+        return false;
+      }
+      if (!setParameter(candidate, command.name, command.text, error))
+      {
+        console.printf("ERROR: %s\n", error);
+        return false;
+      }
+    }
+    if (!validateSettings(candidate, error))
+    {
+      console.printf("ERROR: %s\n", error);
+      return false;
+    }
+    if (candidate.gait != uint32_t(Gait::Legacy))
+      for (size_t i = 0; i < LEG_COUNT; ++i)
+      {
+        Leg check = legs[i];
+        check.target = check.home;
+        check.target.z = candidate.homeZ;
+        Vector angles;
+        calculate_ik(check, angles);
+        if (!reachableFoot(check.target, check.origin, candidate) || !withinJointLimits(angles, i, candidate))
+        {
+          console.printf("ERROR: %s home is outside the calibrated motion envelope; settings unchanged.\n", LEG_NAMES[i]);
+          return false;
+        }
+      }
+    const bool controlChanged = (settings.gait == uint32_t(Gait::Legacy)) !=
+                                (candidate.gait == uint32_t(Gait::Legacy));
+    if (mode == Mode::Off)
+      apply_settings(candidate);
+    else
+    {
+      settings = candidate;
+      settingsDirty = true;
+      for (Leg& leg : legs)
+        leg.home.z = settings.homeZ;
+      if (controlChanged)
+        control = ControlState{};
+    }
+    console.printf("Motion settings updated in RAM; selected %s. Changes settle before use; save while off to persist.\n",
+                   GAIT_NAMES[settings.gait]);
+    return true;
+  }
   if (command.type == CommandType::Off)
   {
     disable_outputs();
@@ -727,6 +817,12 @@ bool execute_command(const Command& command)
   if (command.type == CommandType::Home || command.type == CommandType::Radio ||
       command.type == CommandType::Walk || command.type == CommandType::Web)
   {
+    if (command.type == CommandType::Walk && command.values[2] != 0 &&
+        settings.gait == uint32_t(Gait::Legacy))
+    {
+      console.println("ERROR: strafing requires gait tripod, tetrapod or ripple.");
+      return false;
+    }
     if (command.type == CommandType::Radio && !radioReady)
     {
       console.println("ERROR: radio not ready; use off then init.");
@@ -747,7 +843,7 @@ bool execute_command(const Command& command)
     }
     else if (command.type == CommandType::Walk)
     {
-      manualMotion = {command.values[0], command.values[1], millis(), command.durationMs};
+      manualMotion = {command.values[0], command.values[1], millis(), command.durationMs, command.values[2]};
       mode = Mode::Walk;
       console.println("Timed walking test queued; duration starts when home is ready."
                       " stop cancels startup/returns home, ! disables outputs.");
@@ -879,7 +975,7 @@ bool execute_command(const Command& command)
       if (!load_settings(loaded))
         return false;
       apply_settings(loaded);
-      settingsDirty = false;
+      settingsDirty = settingsNeedMigration;
       break;
     }
     case CommandType::Defaults:
@@ -1009,14 +1105,19 @@ void write_web_status(WebResponse& response)
   snprintf(response.body, sizeof(response.body),
       "{\"mode\":\"%s\",\"generation\":%lu,\"token\":\"%s\",\"drivers\":%s,"
       "\"radioReady\":%s,\"radio\":false,\"dirty\":%s,\"leg\":\"%s\",\"joint\":\"%s\","
-      "\"step\":%u,\"posePending\":%s,\"direction\":%.2f,\"rotation\":%.2f}",
+      "\"step\":%u,\"posePending\":%s,\"direction\":%.2f,\"rotation\":%.2f,\"strafe\":%.2f,"
+      "\"gait\":\"%s\",\"activeGait\":\"%s\",\"settling\":%s,\"motionFault\":%s}",
       MODE_NAMES[size_t(mode)], static_cast<unsigned long>(webGeneration), webTransport.token,
       servosReady ? "true" : "false", radioReady ? "true" : "false",
       settingsDirty ? "true" : "false", LEG_NAMES[servoTest.servoIndex / JOINT_COUNT],
       JOINT_NAMES[servoTest.servoIndex % JOINT_COUNT], unsigned(servoTest.step),
       posePending ? "true" : "false",
       mode == Mode::Web ? webMotion.direction : control.direction,
-      mode == Mode::Web ? webMotion.rotation : control.rotation);
+      mode == Mode::Web ? webMotion.rotation : control.rotation,
+      mode == Mode::Web ? webMotion.strafe : control.strafe,
+      GAIT_NAMES[settings.gait], GAIT_NAMES[size_t(activeGait)],
+      motionEngine.settling() || activeGait != Gait(settings.gait) ? "true" : "false",
+      motionFault ? "true" : "false");
 }
 
 void process_web_request(WebRequest& request, WebResponse& response)
@@ -1069,20 +1170,25 @@ void process_web_request(WebRequest& request, WebResponse& response)
   }
   if (request.type == WebRequestType::Drive)
   {
-    float direction = 0, rotation = 0;
-    if (!parseWebMotion(payload, direction, rotation))
+    float direction = 0, rotation = 0, strafe = 0;
+    if (!parseWebMotion(payload, direction, rotation, strafe))
     {
       response.code = 400;
-      console.println("ERROR: drive requires direction and rotation in -1..1.");
+      console.println("ERROR: drive requires direction rotation [strafe], each in -1..1.");
     }
     else if (mode != Mode::Web)
     {
       response.code = 409;
       console.println("ERROR: explicitly enable web driving first.");
     }
+    else if (strafe != 0 && settings.gait == uint32_t(Gait::Legacy))
+    {
+      response.code = 400;
+      console.println("ERROR: strafing requires an improved gait.");
+    }
     else
     {
-      webMotion = {direction, rotation};
+      webMotion = {direction, rotation, strafe};
       write_web_status(response);
     }
     return;
@@ -1126,6 +1232,8 @@ void setup()
   storageReady = preferences.begin("hexapod", false);
   if (!load_settings(settings))
     console.println("Using factory defaults in RAM; outputs remain disabled.");
+  else
+    settingsDirty = settingsNeedMigration;
   rebuild_geometry();
   init_servos();
   init_control();
@@ -1148,18 +1256,39 @@ void loop()
   update_servo_test(now);
   if (!posePending && uint32_t(now - lastUpdateMs) >= settings.updateMs)
   {
+    const float elapsedMs = float(uint32_t(now - lastUpdateMs));
     lastUpdateMs = now;
     if (mode == Mode::Web)
-      set_foot_positions(webMotion.direction, webMotion.rotation);
+      set_foot_positions(webMotion.direction, webMotion.rotation, webMotion.strafe, elapsedMs);
     else if (mode == Mode::Radio)
-      set_foot_positions(control.direction, control.rotation);
+      set_foot_positions(control.direction, control.rotation, control.strafe, elapsedMs);
     else if (mode == Mode::Walk)
-      set_foot_positions(manualMotion.direction, manualMotion.rotation);
+      set_foot_positions(manualMotion.direction, manualMotion.rotation, manualMotion.strafe, elapsedMs);
     else if (mode == Mode::Home)
-      set_foot_positions(0, 0);
+      set_foot_positions(0, 0, 0, elapsedMs);
   }
   update_servo_outputs(millis());
   delay(1);
+}
+
+void handle_power_button()
+{
+  Command command;
+  if (mode != Mode::Off)
+  {
+    command.type = CommandType::Off;
+    execute_command(command);
+    console.println("Remote button: outputs disabled; safe to switch off servo power.");
+    return;
+  }
+  if (!servosReady && !init_servos())
+  {
+    console.println("Remote button: servo drivers unavailable; outputs remain disabled.");
+    return;
+  }
+  command.type = CommandType::Radio;
+  if (execute_command(command))
+    console.println("Remote button: standing up under ESP-NOW control.");
 }
 
 void read_control()
@@ -1185,6 +1314,9 @@ void read_control()
         ++webGeneration;
         console.println("ESP-NOW takes precedence over web driving; center sticks to arm.");
       }
+      if (powerButton.update(packet.channels[POWER_BUTTON_CHANNEL] == 0, packet.receivedAtMs,
+                             settings.timeoutMs))
+        handle_power_button();
       const bool wasArmed = control.armed;
       if (mode == Mode::Radio)
       {
@@ -1289,7 +1421,7 @@ Vector get_foot_target(float t, size_t legIndex, float direction, float rotation
   return res;
 }
 
-bool set_foot_positions(float direction, float rotation)
+bool set_legacy_foot_positions(float direction, float rotation)
 {
   gaitPhase = fmod(gaitPhase + settings.phaseStep, 1.0);
 
@@ -1312,6 +1444,83 @@ bool set_foot_positions(float direction, float rotation)
 
     if (!queue_servo(i, 0, ax) || !queue_servo(i, 1, ay) || !queue_servo(i, 2, az))
       return false;
+  }
+  return true;
+}
+
+bool motion_error(size_t leg, const char* reason)
+{
+  ++motionLimitCount;
+  motionFault = true;
+  mode = mode == Mode::Off ? Mode::Off : Mode::Pose;
+  ++webGeneration;
+  control = ControlState{};
+  webMotion = WebMotion{};
+  manualMotion = TimedMotion{};
+  posePending = false;
+  memcpy(targetPulses, lastPulses, sizeof(targetPulses));
+  console.printf("ERROR: motion limit at %s: %s. Holding last complete pose; use off to adjust or home to retry.\n",
+                 LEG_NAMES[leg], reason);
+  return false;
+}
+
+bool set_foot_positions(float direction, float rotation, float strafe, float elapsedMs)
+{
+  const Gait selected = Gait(settings.gait);
+  const bool switching = selected != activeGait;
+  if (activeGait == Gait::Legacy)
+  {
+    if (!set_legacy_foot_positions(switching ? 0 : direction, switching ? 0 : rotation))
+      return false;
+    if (switching)
+    {
+      bool settled = true;
+      for (const Leg& leg : legs)
+        settled &= fabsf(leg.target.x - leg.home.x) < 0.001f &&
+                   fabsf(leg.target.y - leg.home.y) < 0.001f &&
+                   fabsf(leg.target.z - leg.home.z) < 0.001f;
+      if (settled)
+      {
+        activeGait = selected;
+        motionEngine.reset(settings);
+        gaitPhase = 0;
+      }
+    }
+    return true;
+  }
+
+  FootTarget homes[LEG_COUNT], targets[LEG_COUNT], angles[LEG_COUNT];
+  for (size_t i = 0; i < LEG_COUNT; ++i)
+    homes[i] = legs[i].home;
+  const MotionInput input = switching ? MotionInput{} : MotionInput{direction, strafe, rotation};
+  if (elapsedMs > MotionEngine::MAX_DT_MS)
+    ++motionOverruns;
+  if (!motionEngine.update(elapsedMs, input, activeGait, settings, homes, targets))
+    return motion_error(0, "invalid motion input");
+  for (size_t i = 0; i < LEG_COUNT; ++i)
+  {
+    if (!reachableFoot(targets[i], legs[i].origin, settings))
+      return motion_error(i, "unreachable foot target");
+    Leg check = legs[i];
+    check.target = targets[i];
+    calculate_ik(check, angles[i]);
+    if (!withinJointLimits(angles[i], i, settings))
+      return motion_error(i, "joint angle/trim outside limits");
+  }
+  // Validate the whole frame before queuing any of it; never leave a partially clipped stance.
+  for (size_t i = 0; i < LEG_COUNT; ++i)
+  {
+    if (!queue_servo(i, 0, 90 + angles[i].x) || !queue_servo(i, 1, 90 + angles[i].y) ||
+        !queue_servo(i, 2, fabsf(angles[i].z)))
+      return false;
+    legs[i].target = targets[i];
+  }
+  gaitPhase = motionEngine.phase();
+  if (switching && motionEngine.atHome(settings))
+  {
+    activeGait = selected;
+    motionEngine.reset(settings);
+    gaitPhase = 0;
   }
   return true;
 }

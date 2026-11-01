@@ -144,6 +144,88 @@ void testControl()
   CHECK(state.expire(520)); // Malformed traffic does not refresh the watchdog.
 }
 
+void testPowerButton()
+{
+  CHECK(POWER_BUTTON_CHANNEL == 6 && POWER_BUTTON_HOLD_MS == 1000);
+  ButtonHold button;
+  // Feeds packets every 20 ms over [from, to); returns how many updates triggered.
+  const auto stream = [&button](bool pressed, uint32_t from, uint32_t to)
+  {
+    int triggers = 0;
+    for (uint32_t now = from; now != to; now += 20)
+      triggers += button.update(pressed, now) ? 1 : 0;
+    return triggers;
+  };
+  // Held from the first packet (stuck or held at power-on): never triggers until released.
+  CHECK(stream(true, 0, 3000) == 0);
+  CHECK(!button.update(false, 3000));
+  CHECK(stream(true, 3020, 4020) == 0);
+  CHECK(button.update(true, 4020));
+  // One trigger per hold; release is required before the next.
+  CHECK(stream(true, 4040, 8000) == 0);
+  CHECK(stream(false, 8000, 8100) == 0);
+  // A short tap does not trigger.
+  CHECK(stream(true, 8100, 9000) == 0);
+  CHECK(stream(false, 9000, 9100) == 0);
+  CHECK(stream(true, 9100, 10100) == 0);
+  CHECK(button.update(true, 10100));
+
+  // A signal gap forgets the release and the hold in progress.
+  button = ButtonHold{};
+  CHECK(stream(false, 0, 100) == 0);
+  CHECK(stream(true, 100, 900) == 0);
+  CHECK(!button.update(true, 1400));
+  CHECK(stream(true, 1420, 3000) == 0);
+  CHECK(stream(false, 3000, 3100) == 0);
+  CHECK(stream(true, 3100, 4100) == 0);
+  CHECK(button.update(true, 4100));
+
+  button = ButtonHold{};
+  const uint32_t nearWrap = UINT32_MAX - 99;
+  CHECK(stream(false, nearWrap - 100, nearWrap) == 0);
+  CHECK(stream(true, nearWrap, nearWrap + 1000) == 0);
+  CHECK(button.update(true, nearWrap + 1000));
+}
+
+void testImprovedControl()
+{
+  Settings settings;
+  settings.gait = uint32_t(Gait::Tripod);
+  float previous = 1;
+  for (uint16_t value = 0; value <= 4095; ++value)
+  {
+    const float command = proportionalStick(value, STICK_CENTER, STICK_DEADZONE);
+    CHECK(command >= -1 && command <= 1 && command <= previous);
+    CHECK((command == 0) == (value >= 1947 && value <= 2147));
+    previous = command;
+  }
+  CHECK(proportionalStick(0, 2047, 100) == 1);
+  CHECK(proportionalStick(4095, 2047, 100) == -1);
+  CHECK(proportionalStick(0, 100, 100) == 0);
+  CHECK(proportionalStick(4095, 3995, 100) == 0);
+  ControlState state;
+  ControlPacket packet = packetAt(0);
+  packet.channels[1] = 0;
+  CHECK(state.receive(packet, 0, settings) && !state.armed && state.strafe == 0);
+  packet.channels[1] = 2047;
+  CHECK(state.receive(packet, 0, settings) && state.armed);
+  packet.channels[2] = 1000;
+  packet.channels[1] = 0;
+  packet.channels[4] = 4095;
+  CHECK(state.receive(packet, 0, settings));
+  CHECK(state.direction > 0.4f && state.direction < 0.6f && state.strafe == 1 && state.rotation == -1);
+  settings.strafeReversed = 1;
+  CHECK(state.receive(packet, 0, settings) && state.strafe == -1);
+  CHECK(state.expire(500) && state.strafe == 0 && state.direction == 0 && state.rotation == 0);
+  const char* error = nullptr;
+  settings.strafeChannel = settings.steeringChannel;
+  CHECK(!validateSettings(settings, error));
+  settings.gait = uint32_t(Gait::Legacy);
+  CHECK(validateSettings(settings, error)); // The unused channel must not break legacy records.
+  settings.gait = 99;
+  CHECK(!validateSettings(settings, error));
+}
+
 void testServos()
 {
   const uint8_t expectedChannels[LEG_COUNT][JOINT_COUNT] = {
@@ -292,6 +374,40 @@ void testSettings()
   CHECK(state.expire(320, settings.timeoutMs));
 }
 
+void testSettingsMigration()
+{
+  Settings original;
+  original.servos[0][0] = {800, 2200, 7, 1};
+  original.servos[5][2] = {1100, 1900, -5, 0};
+  original.origins[0] = {103, -60};
+  original.homeZ = -65;
+  original.throttleChannel = 1; // A legal old mapping that overlaps the new default strafe input.
+  original.motionStride = 70;
+  original.gait = uint32_t(Gait::Ripple);
+  SettingsRecordV1 record{};
+  record.magic = 0x48585044;
+  record.version = 1;
+  memcpy(record.settings, &original, sizeof(record.settings));
+  record.checksum = settingsBytesChecksum(record.settings, sizeof(record.settings));
+  Settings loaded;
+  const char* error = nullptr;
+  bool migrated = false;
+  CHECK(decodeSettings(&record, sizeof(record), loaded, error, &migrated) && migrated);
+  CHECK(memcmp(&loaded, &original, SETTINGS_V1_BYTES) == 0);
+  CHECK(loaded.gait == uint32_t(Gait::Legacy) && loaded.motionStride == 40 && loaded.motionLift == 25);
+  const SettingsRecord upgraded = makeSettingsRecord(loaded);
+  CHECK(upgraded.version == 2);
+  CHECK(decodeSettings(&upgraded, sizeof(upgraded), loaded, error, &migrated) && !migrated);
+  CHECK(memcmp(&loaded, &original, SETTINGS_V1_BYTES) == 0);
+  record.checksum ^= 1;
+  CHECK(!decodeSettings(&record, sizeof(record), loaded, error));
+  CHECK(loaded.servos[0][0].minUs == 800 && loaded.homeZ == -65);
+  record.checksum ^= 1;
+  record.version = 2;
+  CHECK(!decodeSettings(&record, sizeof(record), loaded, error));
+  CHECK(!decodeSettings(&record, sizeof(record) - 1, loaded, error));
+}
+
 bool consoleCommand(const std::string& text, Command& command)
 {
   std::string copy = text;
@@ -308,7 +424,9 @@ void testConsole()
     "off", "stop", "home", "radio", "web", "testservos", "next", "retest", "center", "center all", "center lf",
     "servo rf coxa 90", "pulse 0 0 1500", "joints RR 90 100 110",
     "foot lf -10 0 20", "walk 1 -0.5 10000", "walk 0 0 100",
-    "set step_height 40", "cal lm femur 500 2500 -90 1", "origin rf 100 -60"
+    "set step_height 40", "cal lm femur 500 2500 -90 1", "origin rf 100 -60",
+    "gait legacy", "gait tripod", "gait tetrapod", "gait ripple", "tune motion_lift 20",
+    "move 0.5 -0.2 0.3 5000"
   };
   for (const char* text : valid)
     CHECK(consoleCommand(text, command));
@@ -323,6 +441,8 @@ void testConsole()
   CHECK(command.type == CommandType::Retest);
   CHECK(consoleCommand("WEB", command));
   CHECK(command.type == CommandType::Web);
+  CHECK(consoleCommand("move 0.5 -0.2 0.3 5000", command));
+  CHECK(command.values[0] == 0.5f && command.values[1] == 0.3f && command.values[2] == -0.2f);
   const char* invalid[] =
   {
     "", " ", "help extra", "testservos extra", "testservos rf coxa",
@@ -335,7 +455,10 @@ void testConsole()
     "cal rf coxa 2000 1000 0 0", "cal rf coxa 1000 2000 91 0",
     "cal rf coxa 1000 2000 0 2", "cal rf coxa 1000 2000 0 0 extra",
     "foot lf 151 0 0", "origin rf 501 0", "joints rf 90 90",
-    "set step_height", "a b c d e f g h i"
+    "set step_height", "a b c d e f g h i",
+    "gait wave", "gait 4", "gait", "gait tripod extra",
+    "move 1 2 0 1000", "move 0 0 0 10001", "move 0 0 0", "move nan 0 0 1000",
+    "tune motion_lift"
   };
   for (const char* text : invalid)
     CHECK(!consoleCommand(text, command));
@@ -401,8 +524,11 @@ int main()
 {
   testProtocol();
   testControl();
+  testImprovedControl();
+  testPowerButton();
   testServos();
   testSettings();
+  testSettingsMigration();
   testConsole();
-  puts("PASS: protocol, failsafe, servo output, runtime settings, console parsing and saved records.");
+  puts("PASS: protocol, failsafe, remote power button, servo output, runtime settings, console parsing and saved records.");
 }

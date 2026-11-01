@@ -1233,6 +1233,262 @@ void testWebStaggeringAndInitialization()
   CHECK(mode == Mode::Off && !posePending && activeServos() == 0 && Fake::outputEnable == HIGH);
 }
 
+void streamPackets(const char* csv, uint32_t durationMs)
+{
+  const uint32_t end = Fake::now + durationMs;
+  while (int32_t(end - Fake::now) > 0)
+  {
+    receive(csv);
+    for (int i = 0; i < 19; ++i)
+      loop();
+  }
+}
+
+void testRemotePowerCycle()
+{
+  send("off");
+  send("init");
+  CHECK(mode == Mode::Off && servosReady && radioReady && Fake::outputEnable == HIGH);
+  const char* neutral = "0,2047,2047,2047,2047,2047,1,1,1,1";
+  const char* pressed = "0,2047,2047,2047,2047,2047,0,1,1,1";
+  const char* forward = "0,2047,0,2047,2047,2047,1,1,1,1";
+
+  // A button already held when the link appears is ignored until released.
+  streamPackets(pressed, 2000);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 900);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  Serial.output.clear();
+  streamPackets(pressed, 200);
+  CHECK(mode == Mode::Radio && posePending && control.armed && Fake::outputEnable == LOW);
+  CHECK(Serial.output.find("Remote button: standing up") != std::string::npos);
+  streamPackets(pressed, 2000);
+  streamPackets(neutral, 5000);
+  CHECK(mode == Mode::Radio && !posePending && control.armed);
+  streamPackets(forward, 200);
+  CHECK(mode == Mode::Radio && control.direction == 1);
+
+  // Short taps do not disable; a 1 s hold releases torque for power-off.
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 500);
+  streamPackets(neutral, 100);
+  CHECK(mode == Mode::Radio && Fake::outputEnable == LOW);
+  Serial.output.clear();
+  streamPackets(pressed, 1100);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  CHECK(Serial.output.find("safe to switch off servo power") != std::string::npos);
+  streamPackets(pressed, 3000);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+
+  // Signal loss forgets a hold in progress.
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 800);
+  Fake::now += settings.timeoutMs;
+  loop();
+  streamPackets(pressed, 1000);
+  CHECK(mode == Mode::Off);
+
+  // The button retries driver initialization when the drivers were not ready.
+  Fake::boardsPresent = false;
+  send("init");
+  CHECK(!servosReady);
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 1100);
+  CHECK(mode == Mode::Off && !servosReady && Fake::outputEnable == HIGH);
+  Fake::boardsPresent = true;
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 1100);
+  CHECK(servosReady && mode == Mode::Radio);
+
+  // Any active mode is disabled by the button, including serial-selected ones.
+  send("off");
+  send("home");
+  streamPackets(neutral, 100);
+  streamPackets(pressed, 1100);
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  streamPackets(neutral, 100);
+}
+
+void runMotionFor(unsigned ms)
+{
+  for (unsigned elapsed = 0; elapsed < ms; ++elapsed)
+    loop();
+}
+
+void testImprovedGaits()
+{
+  for (const char* gait : {"tripod", "tetrapod", "ripple"})
+    for (const char* axes : {"1 0 0", "-1 0 0", "0 1 0", "0 -1 0", "0 0 1",
+                             "0 0 -1", "1 1 1", "-1 -1 -1", "0.1 0 0"})
+    {
+      prepareWebTest();
+      send(std::string("gait ") + gait);
+      CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && settingsDirty);
+      CHECK(settings.gait != uint32_t(Gait::Legacy));
+      send(std::string("move ") + axes + " 8000");
+      CHECK(mode == Mode::Walk && !posePending && !motionFault);
+      for (unsigned ms = 0; ms < 6000; ++ms)
+      {
+        const size_t before = Fake::pwmWrites.size();
+        loop();
+        CHECK(mode == Mode::Walk && !motionFault);
+        CHECK(Fake::pwmWrites.size() - before <= SERVO_COUNT);
+        CHECK(memcmp(targetPulses, lastPulses, sizeof(lastPulses)) == 0);
+      }
+      send("stop");
+      runMotionFor(1250);
+      CHECK(mode == Mode::Home && motionEngine.atHome(settings));
+      for (const Leg& leg : legs)
+        CHECK(leg.target.x == leg.home.x && leg.target.y == leg.home.y && leg.target.z == leg.home.z);
+      checkPhasedPulses();
+    }
+}
+
+void testLiveMotionControls()
+{
+  prepareWebTest();
+  send("move 0 1 0 1000");
+  CHECK(mode == Mode::Off && Serial.output.find("strafing requires") != std::string::npos);
+  CHECK(webCommand("gait tripod").status == "200 OK");
+  CHECK(webCommand("web").status == "200 OK");
+  CHECK(webCommand("gait ripple").status == "400 Bad Request"); // No changes mid startup.
+  finishWebPose();
+  const uint32_t generation = webGeneration;
+  CHECK(webDrive("0.5 -0.25 0.5", generation).status == "200 OK");
+  CHECK(webMotion.direction == 0.5f && webMotion.rotation == -0.25f && webMotion.strafe == 0.5f);
+  runMotionFor(2000);
+  CHECK(mode == Mode::Web && !motionFault);
+  CHECK(webCommand("gait tetrapod").status == "200 OK");
+  CHECK(webGeneration == generation && activeGait == Gait::Tripod);
+  runMotionFor(1250);
+  CHECK(activeGait == Gait::Tetrapod && mode == Mode::Web);
+  CHECK(webCommand("tune motion_stride 30").status == "200 OK");
+  CHECK(webCommand("tune motion_lift 20").status == "200 OK");
+  CHECK(webCommand("tune motion_turn 8").status == "200 OK");
+  CHECK(webCommand("tune motion_cycle_ms 2200").status == "200 OK");
+  CHECK(webCommand("tune home_z -50").status == "200 OK");
+  CHECK(settings.motionStride == 30 && settings.homeZ == -50 && webGeneration == generation);
+  runMotionFor(3000);
+  CHECK(mode == Mode::Web && !motionFault);
+  CHECK(webCommand("tune home_z -200").status == "400 Bad Request");
+  CHECK(settings.homeZ == -50);
+  CHECK(webCommand("tune coxa_length 45").status == "400 Bad Request");
+  CHECK(settings.coxaLength == 38);
+  CHECK(webDrive("0 0 2", generation).status == "400 Bad Request");
+  CHECK(webDrive("0 0 0 extra", generation).status == "400 Bad Request");
+  CHECK(webDrive("nan 0 0", generation).status == "400 Bad Request");
+  CHECK(webDrive("0 0", generation).status == "200 OK");
+  CHECK(webMotion.strafe == 0);
+  runMotionFor(1250);
+  CHECK(motionEngine.atHome(settings));
+  CHECK(webCommand("gait legacy").status == "200 OK");
+  runMotionFor(100);
+  CHECK(activeGait == Gait::Legacy && webGeneration == generation);
+  CHECK(webDrive("0 0 1", generation).status == "400 Bad Request");
+  CHECK(webCommand("tune motion_lift 30").status == "400 Bad Request");
+  send("walk 1 0 6000");
+  runMotionFor(1000);
+  send("gait ripple");
+  CHECK(activeGait == Gait::Legacy);
+  runMotionFor(1500);
+  CHECK(activeGait == Gait::Ripple && mode == Mode::Walk && !motionFault);
+  send("off");
+}
+
+void testImprovedRadioAndFaults()
+{
+  prepareWebTest();
+  send("gait tripod");
+  send("radio");
+  receive("0,0,2047,2047,2047,2047,1,1,1,1");
+  CHECK(!control.armed && control.strafe == 0);
+  receive("0,2047,2047,2047,2047,2047,1,1,1,1");
+  CHECK(control.armed);
+  receive("0,1000,1000,2047,2047,2047,1,1,1,1");
+  CHECK(control.strafe > 0.4f && control.strafe < 0.6f && control.direction > 0.4f);
+  runMotionFor(1800);
+  CHECK(!control.armed && mode == Mode::Radio && motionEngine.atHome(settings));
+  receive("0,0,0,2047,2047,2047,1,1,1,1");
+  CHECK(!control.armed && control.strafe == 0);
+  send("home");
+  Fake::now = UINT32_MAX - 20;
+  lastUpdateMs = millis();
+  send("move 1 1 0 3000");
+  runMotionFor(500);
+  const uint32_t overruns = motionOverruns;
+  Fake::now += 1000;
+  loop();
+  CHECK(motionOverruns == overruns + 1 && mode == Mode::Walk);
+  Fake::writesUntilFailure = 3;
+  Fake::now += settings.updateMs;
+  loop();
+  CHECK(mode == Mode::Off && !servosReady && Fake::outputEnable == HIGH);
+  Fake::writesUntilFailure = -1;
+
+  prepareWebTest();
+  send("set motion_stride 80");
+  send("set motion_lift 80");
+  send("gait tripod");
+  send("move 1 1 1 10000");
+  bool fault = false;
+  for (unsigned ms = 0; ms < 10000 && !fault; ++ms)
+  {
+    const auto before = Fake::pwmWrites.size();
+    loop();
+    if (motionFault)
+    {
+      fault = true;
+      CHECK(Fake::pwmWrites.size() == before);
+      CHECK(mode == Mode::Pose && Fake::outputEnable == LOW && servosReady);
+      CHECK(memcmp(targetPulses, lastPulses, sizeof(lastPulses)) == 0);
+      CHECK(Serial.output.find("Holding last complete pose") != std::string::npos);
+    }
+  }
+  CHECK(fault);
+  const size_t held = Fake::pwmWrites.size();
+  runMotionFor(1000);
+  CHECK(Fake::pwmWrites.size() == held && mode == Mode::Pose);
+  send("off");
+  send("defaults");
+  send("cal rf femur 1000 2000 90 0");
+  send("gait tripod");
+  CHECK(settings.gait == uint32_t(Gait::Legacy) && mode == Mode::Off);
+  CHECK(Serial.output.find("home is outside") != std::string::npos);
+  send("defaults");
+}
+
+void testFirmwareSettingsMigration()
+{
+  prepareWebTest();
+  Settings original = settings;
+  original.servos[0][0] = {900, 2100, 5, 1};
+  original.origins[0] = {103, -60};
+  original.stepHeight = 75;
+  SettingsRecordV1 record{};
+  record.magic = 0x48585044;
+  record.version = 1;
+  memcpy(record.settings, &original, sizeof(record.settings));
+  record.checksum = settingsBytesChecksum(record.settings, sizeof(record.settings));
+  Fake::saved.resize(sizeof(record));
+  memcpy(Fake::saved.data(), &record, sizeof(record));
+  const unsigned saves = Fake::saves;
+  setup();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH);
+  CHECK(Fake::saves == saves && settingsDirty && settingsNeedMigration);
+  CHECK(memcmp(&settings, &original, SETTINGS_V1_BYTES) == 0);
+  CHECK(settings.gait == uint32_t(Gait::Legacy));
+  send("save");
+  CHECK(!settingsDirty && !settingsNeedMigration && Fake::saved.size() == sizeof(SettingsRecord));
+  send("gait ripple");
+  send("tune motion_stride 35");
+  send("save");
+  setup();
+  CHECK(mode == Mode::Off && Fake::outputEnable == HIGH && !settingsDirty);
+  CHECK(settings.gait == uint32_t(Gait::Ripple) && settings.motionStride == 35);
+  CHECK(settings.servos[0][0].minUs == 900 && settings.servos[0][0].reversed == 1);
+}
+
 int main()
 {
   testBootAndPoses();
@@ -1253,5 +1509,10 @@ int main()
   testGaitFrameDelaysAndFaults();
   testGaitFramesAndPwm();
   testWebStaggeringAndInitialization();
-  puts("PASS: firmware console, staggered poses, coherent gait frames/PWM, servo tests, NVS, web API without driving timeout, AP fallback, ESP-NOW priority and watchdog/fault recovery.");
+  testRemotePowerCycle();
+  testImprovedGaits();
+  testLiveMotionControls();
+  testImprovedRadioAndFaults();
+  testFirmwareSettingsMigration();
+  puts("PASS: firmware console, staggered poses, coherent gait frames/PWM, servo tests, NVS, web API without driving timeout, AP fallback, ESP-NOW priority, remote power button and watchdog/fault recovery.");
 }

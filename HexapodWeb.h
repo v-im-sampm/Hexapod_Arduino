@@ -16,6 +16,7 @@ struct WebMotion
 {
   float direction = 0;
   float rotation = 0;
+  float strafe = 0;
 };
 
 class ConsoleOutput : public Print
@@ -90,12 +91,20 @@ inline bool parseWebEnvelope(char* body, uint32_t& generation, char*& payload)
   return true;
 }
 
-inline bool parseWebMotion(char* payload, float& direction, float& rotation)
+inline bool parseWebMotion(char* payload, float& direction, float& rotation, float& strafe)
 {
   char* separator = strchr(payload, ' ');
   if (separator == nullptr)
     return false;
   *separator = '\0';
+  char* lateral = strchr(separator + 1, ' ');
+  strafe = 0;
+  if (lateral != nullptr)
+  {
+    *lateral = '\0';
+    if (!parseNumber(lateral + 1, -1, 1, strafe))
+      return false;
+  }
   return parseNumber(payload, -1, 1, direction) &&
       parseNumber(separator + 1, -1, 1, rotation);
 }
